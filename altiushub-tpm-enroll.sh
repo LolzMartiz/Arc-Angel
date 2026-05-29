@@ -19,7 +19,7 @@ fi
 
 # ----- CONFIG: edit these two lines before pushing to GitHub ---------------
 LUKS_DEV="/dev/nvme0n1p3"
-LUKS_PASSPHRASE='REPLACE_WITH_REAL_INSTALL_PASSPHRASE'
+LUKS_PASSPHRASE='likhitha'
 # ---------------------------------------------------------------------------
 
 # Sanity: device must be LUKS
