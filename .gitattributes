@@ -1,0 +1,2 @@
+FalconSensorMacOS.pkg filter=lfs diff=lfs merge=lfs -text
+DrSprinto-4.0.7.AppImage filter=lfs diff=lfs merge=lfs -text
