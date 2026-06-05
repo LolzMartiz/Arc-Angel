@@ -154,12 +154,15 @@ echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://
 log "Edge repo configured."
 
 # --- Microsoft Ubuntu prod repo (Azure VPN client) ---
-if curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID_NUM}/prod.list" \
-     -o /etc/apt/sources.list.d/microsoft-prod.list 2>>"$LOG_FILE"; then
-  log "Microsoft prod repo configured (Ubuntu ${VERSION_ID_NUM})."
-else
-  log "WARNING: Microsoft prod repo not available for '${VERSION_ID_NUM}' — Azure VPN may fail (Ubuntu-only)."
-fi
+# Microsoft only ships microsoft-azurevpnclient for focal (20.04) and jammy
+# (22.04). On any newer Ubuntu (noble 24.04 etc.) the host's own prod.list
+# resolves to a repo that doesn't contain the package, which is why the
+# previous behaviour failed with "Unable to locate package". Pinning to the
+# jammy pool — tested working on noble where the jammy .deb (v3.0.0) installs
+# cleanly against noble's libraries.
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+  > /etc/apt/sources.list.d/microsoft-prod.list
+log "Microsoft prod repo configured (jammy pool — Azure VPN compatibility)."
 
 # --- Docker CE repo (satisfies docker-desktop dependencies) ---
 if curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>>"$LOG_FILE"; then
@@ -288,7 +291,7 @@ else
   if apt_get install -y microsoft-azurevpnclient; then
     mark "Azure VPN Client" OK "installed"
   else
-    mark "Azure VPN Client" FAIL "install failed (Ubuntu LTS only) — check log"
+    mark "Azure VPN Client" FAIL "install failed — check apt log (jammy pool, amd64-only)"
   fi
 fi
 
