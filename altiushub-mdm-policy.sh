@@ -165,10 +165,14 @@ else
   fi
 fi
 
-# Save credentials to a root-only file
+# Save credentials to a root-only file.
+# Subshell scopes the umask change so it can't leak into later modules
+# (without this, Module 2's mkdir -p inherited 077 and created the policy
+# dirs as 700 — Chrome couldn't traverse in and silently dropped the policy).
 if [[ $DRY_RUN -eq 0 ]]; then
-  umask 077
-  cat > "$CRED_FILE" <<EOF
+  (
+    umask 077
+    cat > "$CRED_FILE" <<EOF
 AltiusHub admin credentials
 Generated: $(date '+%Y-%m-%d %H:%M:%S')
 Host:      $(hostname)
@@ -177,7 +181,8 @@ Password:  $EFFECTIVE_PASSWORD
 
 Store this securely. This file is readable only by root.
 EOF
-  chmod 600 "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+  )
 fi
 
 # ---- 1.2 Verify auth + sudo (LOCKOUT GUARD) -------------------------------
@@ -369,6 +374,11 @@ write_browser_policy() {
     return 0
   fi
   mkdir -p "$dir"
+  # Chrome/Edge read managed policy as the logged-in user, not as root.
+  # The dir chain must be world-traversable (+x) and the JSON world-readable,
+  # otherwise the browser silently fails to load the policy. Explicit chmod
+  # protects against any inherited umask from earlier in the script.
+  chmod 755 "$dir" "$(dirname "$dir")" "$(dirname "$(dirname "$dir")")"
   cat > "$dir/$BROWSER_POLICY_FILE" <<EOF
 {
   "ExtensionInstallBlocklist": ["*"],
