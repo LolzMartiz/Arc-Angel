@@ -37,9 +37,15 @@ echo "  Testing as:     $TARGET_USER  (uid=$(id -u "$TARGET_USER"))"
 echo "================================================================="
 
 hdr "1. CLI TOOLS (terminal-only — should be on PATH for every user)"
-for t in kubectl minikube docker docker-compose; do
-  asu "$t on PATH" "command -v $t"
-done
+for t in kubectl minikube docker; do asu "$t" "command -v $t"; done
+# docker-compose may exist as standalone v1 OR as the v2 plugin 'docker compose'
+if sudo -u "$TARGET_USER" bash -c "command -v docker-compose" >/dev/null 2>&1; then
+  ok "docker-compose (v1 standalone) on PATH"
+elif sudo -u "$TARGET_USER" bash -c "docker compose version" >/dev/null 2>&1; then
+  ok "docker compose (v2 plugin) available"
+else
+  fail "neither 'docker-compose' nor 'docker compose' usable by $TARGET_USER (check docker group membership)"
+fi
 
 hdr "2. SYSTEM BROWSERS (Chrome / Edge .deb)"
 for t in google-chrome microsoft-edge; do
@@ -54,18 +60,37 @@ for d in google-chrome microsoft-edge; do
 done
 
 hdr "3. APT-INSTALLED GUI APPS"
-for pkg in microsoft-azurevpnclient pgadmin4-desktop; do
-  if dpkg -s "$pkg" >/dev/null 2>&1; then
-    if compgen -G "/usr/share/applications/${pkg}*.desktop" >/dev/null \
-       || compgen -G "/usr/share/applications/*${pkg/-desktop/}*.desktop" >/dev/null; then
-      ok "$pkg installed + .desktop present"
-    else
-      warn "$pkg installed but no .desktop found"
-    fi
+# Microsoft Edge .desktop check
+if dpkg -s microsoft-edge-stable >/dev/null 2>&1; then
+  if compgen -G "/usr/share/applications/microsoft-edge*.desktop" >/dev/null; then
+    ok "microsoft-edge-stable installed + .desktop present"
   else
-    fail "$pkg not installed"
+    warn "microsoft-edge-stable installed but no .desktop found"
   fi
-done
+else
+  fail "microsoft-edge-stable not installed"
+fi
+# Azure VPN
+if dpkg -s microsoft-azurevpnclient >/dev/null 2>&1; then
+  if compgen -G "/usr/share/applications/*azurevpn*.desktop" >/dev/null \
+     || compgen -G "/usr/share/applications/microsoft-azurevpn*.desktop" >/dev/null; then
+    ok "microsoft-azurevpnclient installed + .desktop present"
+  else
+    warn "microsoft-azurevpnclient installed but no .desktop found"
+  fi
+else
+  fail "microsoft-azurevpnclient not installed"
+fi
+# pgAdmin4 (Postgres tools team ships the .desktop as pgadmin4.desktop, not pgadmin4-desktop.desktop)
+if dpkg -s pgadmin4-desktop >/dev/null 2>&1; then
+  if compgen -G "/usr/share/applications/pgadmin4*.desktop" >/dev/null; then
+    ok "pgadmin4-desktop installed + .desktop present"
+  else
+    warn "pgadmin4-desktop installed but no .desktop found"
+  fi
+else
+  fail "pgadmin4-desktop not installed"
+fi
 
 hdr "4. DOCKER DESKTOP"
 if dpkg -s docker-desktop >/dev/null 2>&1; then
@@ -87,7 +112,12 @@ if [[ -d /opt/pycharm ]]; then
       break
     fi
   done
-  [[ -f /usr/share/applications/jetbrains-pycharm.desktop ]] && ok "jetbrains-pycharm.desktop present" || warn "no jetbrains-pycharm.desktop — not in launcher"
+  if compgen -G "/usr/share/applications/pycharm*.desktop" >/dev/null \
+     || compgen -G "/usr/share/applications/jetbrains-pycharm*.desktop" >/dev/null; then
+    ok "PyCharm .desktop present (in launcher)"
+  else
+    warn "no PyCharm .desktop — not in launcher"
+  fi
 else
   fail "/opt/pycharm missing"
 fi
@@ -137,7 +167,13 @@ if command -v flatpak >/dev/null 2>&1; then
   echo "  $TARGET_USER's effective XDG_DATA_DIRS (login shell):"
   xdg=$(sudo -u "$TARGET_USER" bash -lc 'echo "$XDG_DATA_DIRS"' 2>/dev/null)
   echo "    $xdg"
-  if [[ "$xdg" == *flatpak* ]]; then ok "XDG_DATA_DIRS includes flatpak exports"; else fail "XDG_DATA_DIRS missing flatpak path"; fi
+  # Check specifically for the SYSTEM flatpak path, not user-local — user-local
+  # alone isn't enough to see system-installed flatpaks in the launcher.
+  if [[ "$xdg" == *"/var/lib/flatpak/exports/share"* ]]; then
+    ok "XDG_DATA_DIRS includes SYSTEM flatpak exports (/var/lib/flatpak/exports/share)"
+  else
+    fail "XDG_DATA_DIRS missing /var/lib/flatpak/exports/share — system flatpaks invisible in launcher until user logs out + back in"
+  fi
   echo ""
   echo "  Flatpak desktop exports on disk:"
   ls -la /var/lib/flatpak/exports/share/applications/ 2>/dev/null | sed 's/^/    /' || echo "    (none)"
@@ -146,6 +182,9 @@ else
 fi
 
 hdr "9. SUMMARY HINT"
-echo "  Re-run for a different user:    sudo bash $0 <username>"
-echo "  Test the AltiusHub admin user:  sudo bash $0 AltiusHub"
+SELF_URL="https://raw.githubusercontent.com/LolzMartiz/Arc-Angel/refs/heads/main/altiushub-verify-access.sh"
+echo "  Re-run as a different user:"
+echo "    curl -fsSL $SELF_URL | sudo bash -s <username>"
+echo "  Test the AltiusHub admin user (if created):"
+echo "    curl -fsSL $SELF_URL | sudo bash -s AltiusHub"
 echo ""
