@@ -75,6 +75,20 @@ apt_install_soft() {
   done
 }
 
+# pkg_installed PKGNAME — returns 0 only if package is FULLY installed
+# (not 'rc' / config-files-only). `dpkg -s` lies in rc-state; this is the
+# reliable check. Use everywhere we'd otherwise be tempted to use `dpkg -s`.
+pkg_installed() {
+  [[ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" == "installed" ]]
+}
+
+# refresh_desktop_db — call after writing or removing a .desktop file so the
+# new/updated entry shows up in the GNOME app grid without forcing logout.
+refresh_desktop_db() {
+  command -v update-desktop-database >/dev/null 2>&1 \
+    && update-desktop-database /usr/share/applications/ >>"$LOG_FILE" 2>&1 || true
+}
+
 # ============================ PREFLIGHT ======================================
 [[ $EUID -eq 0 ]] || { echo "Run as root."; exit 1; }
 mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; chmod 600 "$LOG_FILE"
@@ -141,6 +155,33 @@ apt_get install -y libfuse2 || apt_get install -y libfuse2t64 || log "  (libfuse
 section "CONFIGURE THIRD-PARTY APT REPOS"
 install -d -m 0755 /usr/share/keyrings /etc/apt/keyrings
 
+# --- Strip pre-existing conflicting Microsoft repo files -------------------
+# Some endpoints arrive with a third-party Microsoft repo file already
+# present (manual install, Scalefusion app catalog, leftover from an Azure CLI
+# install, etc.) that declares the SAME repo we're about to add but with a
+# different (or missing) signed-by clause. apt treats that as a FATAL
+# "Conflicting values set for option Signed-By" error and refuses to read
+# ANY sources, breaking every subsequent install in this script.
+#
+# Defensive sweep: any pre-existing file matching our Microsoft repos (and
+# not owned by us by name) gets removed. Our own writes immediately follow.
+ms_repo_cleanup() {
+  local our_file="$1" pattern="$2" f
+  for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    [[ "$f" == "$our_file" ]] && continue
+    if grep -qE "$pattern" "$f" 2>/dev/null; then
+      log "Removing pre-existing conflicting Microsoft repo file: $f"
+      rm -f "$f"
+    fi
+  done
+}
+# Also kill any half-written / truncated-name files in sources.list.d that
+# trip apt's parser (e.g. an orphaned 'microsoft-' file with no extension).
+for f in /etc/apt/sources.list.d/microsoft-; do
+  [[ -f "$f" ]] && { log "Removing orphan repo file: $f"; rm -f "$f"; }
+done
+
 # --- Microsoft signing key (shared by Edge repo + Azure VPN prod repo) ---
 if curl -fsSL "$MS_KEY_URL" | gpg --dearmor --yes -o /usr/share/keyrings/microsoft-prod.gpg 2>>"$LOG_FILE"; then
   log "Microsoft signing key installed."
@@ -149,6 +190,7 @@ else
 fi
 
 # --- Microsoft Edge repo (amd64 build only; harmless to add on arm64) ---
+ms_repo_cleanup /etc/apt/sources.list.d/microsoft-edge.list 'packages\.microsoft\.com/repos/edge'
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/repos/edge stable main" \
   > /etc/apt/sources.list.d/microsoft-edge.list
 log "Edge repo configured."
@@ -160,6 +202,7 @@ log "Edge repo configured."
 # previous behaviour failed with "Unable to locate package". Pinning to the
 # jammy pool — tested working on noble where the jammy .deb (v3.0.0) installs
 # cleanly against noble's libraries.
+ms_repo_cleanup /etc/apt/sources.list.d/microsoft-prod.list 'packages\.microsoft\.com/ubuntu/[0-9.]+/prod'
 echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
   > /etc/apt/sources.list.d/microsoft-prod.list
 log "Microsoft prod repo configured (jammy pool — Azure VPN compatibility)."
@@ -211,6 +254,22 @@ if have flatpak; then
       && log "Flathub remote added." || log "Failed to add Flathub remote."
   fi
 
+  # Ensure /var/lib/flatpak/exports/share is on every user's XDG_DATA_DIRS.
+  # Ubuntu noble's stock /etc/profile.d/flatpak.sh only injects the per-user
+  # path (~/.local/share/flatpak/exports/share); system-installed flatpaks
+  # then never appear in the GNOME launcher or shell completions. We drop
+  # our own profile script as a hard guarantee.
+  cat > /etc/profile.d/altiushub-flatpak.sh <<'EOF'
+# AltiusHub fleet: ensure system-installed flatpaks are discoverable for all
+# users (XDG_DATA_DIRS expansion for system flatpak exports).
+case ":${XDG_DATA_DIRS:-}:" in
+  *":/var/lib/flatpak/exports/share:"*) ;;
+  *) export XDG_DATA_DIRS="/var/lib/flatpak/exports/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}" ;;
+esac
+EOF
+  chmod 0644 /etc/profile.d/altiushub-flatpak.sh
+  log "Wrote /etc/profile.d/altiushub-flatpak.sh — users need to log out + back in for flatpak apps to appear in launcher."
+
   section "INSTALL FLATPAK APPS"
   for entry in "${FLATPAK_APPS[@]}"; do
     name="${entry%%|*}"; appid="${entry##*|}"
@@ -234,15 +293,71 @@ fi
 # MODULE 2 — pgAdmin4  (official apt repo, amd64-only)
 ###############################################################################
 section "pgAdmin4"
+# Proper install-state check via pkg_installed (rc-state safe).
 if [[ $IS_AMD64 -eq 0 ]]; then
   mark "pgAdmin4" SKIP "amd64-only (current arch: $ARCH)"
-elif dpkg -s pgadmin4-desktop >/dev/null 2>&1; then
-  mark "pgAdmin4" SKIP "already installed"
 else
-  if apt_get install -y pgadmin4-desktop; then
-    mark "pgAdmin4" OK "installed (pgadmin4-desktop)"
+  if pkg_installed pgadmin4-desktop; then
+    mark "pgAdmin4" SKIP "already installed"
   else
-    mark "pgAdmin4" FAIL "install failed — codename '$CODENAME' may not be in pgAdmin repo yet"
+    # Includes fresh install AND rc-state recovery (purge then install).
+    pg_state="$(dpkg-query -W -f='${db:Status-Status}' pgadmin4-desktop 2>/dev/null || true)"
+    if [[ -n "$pg_state" && "$pg_state" != "installed" ]]; then
+      log "pgadmin4-desktop is in '$pg_state' state — purging leftover config before reinstall."
+      apt_get purge -y pgadmin4-desktop || true
+    fi
+    if apt_get install -y pgadmin4-desktop; then
+      mark "pgAdmin4" OK "installed (pgadmin4-desktop)"
+    else
+      mark "pgAdmin4" FAIL "install failed — codename '$CODENAME' may not be in pgAdmin repo yet"
+    fi
+  fi
+
+  # Always ensure a launcher entry exists at /usr/share/applications/. The
+  # upstream package lands its .desktop file under /usr/pgadmin4/share/ which
+  # GNOME does not index — so even on a successful install the app stays
+  # invisible to end users until we drop a proper entry here. Runs on both
+  # fresh installs and SKIP path so existing endpoints heal on next push.
+  if pkg_installed pgadmin4-desktop; then
+    # Locate the binary safely. Try known paths first; fall back to dpkg
+    # contents while filtering for actually-executable files outside /etc/
+    # (the package ships an AppArmor profile at /etc/apparmor.d/pgadmin4
+    # which a loose grep would otherwise pick up as the "binary").
+    pg_bin=""
+    for cand in \
+        /usr/pgadmin4/bin/pgadmin4 \
+        /usr/share/pgadmin4-desktop/pgadmin4 \
+        /usr/bin/pgadmin4 \
+        /opt/pgadmin4/bin/pgadmin4; do
+      [[ -x "$cand" && ! -d "$cand" ]] && { pg_bin="$cand"; break; }
+    done
+    if [[ -z "$pg_bin" ]]; then
+      while IFS= read -r f; do
+        [[ -f "$f" && -x "$f" && "$f" != /etc/* ]] && { pg_bin="$f"; break; }
+      done < <(dpkg -L pgadmin4-desktop 2>/dev/null | grep -E 'pgadmin4(-desktop)?$')
+    fi
+    pg_icon="$(dpkg -L pgadmin4-desktop 2>/dev/null | grep -E 'pgadmin4\.(png|svg)$' | head -1)"
+    pg_icon="${pg_icon:-/usr/share/pixmaps/pgadmin4.png}"
+    if [[ -n "$pg_bin" && -x "$pg_bin" ]]; then
+      cat > /usr/share/applications/pgadmin4.desktop <<EOF
+[Desktop Entry]
+Name=pgAdmin 4
+GenericName=PostgreSQL Tools
+Comment=Manage PostgreSQL databases
+Exec=$pg_bin
+Icon=$pg_icon
+Type=Application
+Categories=Development;Database;
+Terminal=false
+StartupNotify=true
+StartupWMClass=pgAdmin4
+EOF
+      chmod 0644 /usr/share/applications/pgadmin4.desktop
+      log "Wrote /usr/share/applications/pgadmin4.desktop (binary: $pg_bin)"
+      refresh_desktop_db
+    else
+      log "WARNING: pgadmin4-desktop installed but no executable launcher found — .desktop entry not written."
+    fi
   fi
 fi
 
@@ -285,7 +400,7 @@ fi
 section "AZURE VPN CLIENT"
 if [[ $IS_AMD64 -eq 0 ]]; then
   mark "Azure VPN Client" SKIP "amd64-only (current arch: $ARCH)"
-elif dpkg -s microsoft-azurevpnclient >/dev/null 2>&1; then
+elif pkg_installed microsoft-azurevpnclient; then
   mark "Azure VPN Client" SKIP "already installed"
 else
   if apt_get install -y microsoft-azurevpnclient; then
@@ -301,7 +416,7 @@ fi
 section "DOCKER DESKTOP"
 if [[ $IS_AMD64 -eq 0 ]]; then
   mark "Docker Desktop" SKIP "amd64-only on Linux (current arch: $ARCH)"
-elif dpkg -s docker-desktop >/dev/null 2>&1; then
+elif pkg_installed docker-desktop; then
   mark "Docker Desktop" SKIP "already installed"
 else
   log "Installing virtualization dependencies..."
@@ -314,6 +429,29 @@ else
   else
     mark "Docker Desktop" FAIL "download or install failed — check log"
   fi
+fi
+
+# Add the standard user (UID 1000) and AltiusHub admin (if present) to the
+# 'docker' group so they can talk to the daemon without sudo. Runs every time
+# regardless of whether Docker was a fresh install or already present — group
+# membership is the most common reason 'docker version' fails for a logged-in
+# user even when Docker itself is installed correctly.
+if getent group docker >/dev/null 2>&1; then
+  for u in "$(awk -F: '$3==1000 {print $1; exit}' /etc/passwd)" AltiusHub; do
+    [[ -n "$u" ]] || continue
+    id "$u" >/dev/null 2>&1 || continue
+    if id -nG "$u" 2>/dev/null | grep -qw docker; then
+      log "User '$u' already in docker group."
+    else
+      if usermod -aG docker "$u" 2>>"$LOG_FILE"; then
+        log "Added user '$u' to docker group (effective on next login)."
+      else
+        log "WARNING: could not add '$u' to docker group."
+      fi
+    fi
+  done
+else
+  log "No 'docker' group found — Docker Desktop install may have failed."
 fi
 
 ###############################################################################
@@ -351,6 +489,22 @@ fi
 # MODULE 8 — DR. SPRINTO (AppImage)
 ###############################################################################
 section "DR. SPRINTO"
+# libfuse2 is a HARD requirement — without it the AppImage cannot launch,
+# even though it's already on disk. The early base-deps step tries it as a
+# soft install and may have skipped (e.g. apt was broken at that point).
+# Retry now; package name differs between 22.04/jammy (libfuse2) and
+# 24.04/noble (libfuse2t64).
+if ! dpkg -l 2>/dev/null | grep -qE '^ii  +libfuse2(t64)? '; then
+  log "libfuse2 missing — installing now for Dr. Sprinto AppImage runtime..."
+  if apt_get install -y libfuse2t64; then
+    log "libfuse2t64 installed (noble/24.04 package)."
+  elif apt_get install -y libfuse2; then
+    log "libfuse2 installed (jammy/22.04 package)."
+  else
+    log "WARNING: libfuse2 install failed — Dr. Sprinto will be unable to launch."
+  fi
+fi
+
 if [[ -x "$DRSPRINTO_PATH" ]]; then
   mark "Dr. Sprinto" SKIP "already present ($DRSPRINTO_PATH)"
 else
@@ -366,6 +520,8 @@ Type=Application
 Categories=Utility;Security;
 Terminal=false
 EOF
+    chmod 0644 /usr/share/applications/drsprinto.desktop
+    refresh_desktop_db
     mark "Dr. Sprinto" OK "installed ($DRSPRINTO_PATH)"
   else
     mark "Dr. Sprinto" FAIL "download failed — check URL/log"
@@ -381,40 +537,58 @@ TOOLBOX_URL="${JB_DOWNLOAD_BASE}?code=TBA&platform=${JB_PLATFORM}"
 log "JetBrains platform code for this arch: $JB_PLATFORM"
 
 # --- PyCharm direct to /opt ---
-if [[ -d "$PYCHARM_DIR" ]] && [[ -n "$(ls -A "$PYCHARM_DIR" 2>/dev/null)" ]]; then
+# Locate the launcher inside an existing /opt/pycharm install (if any). This
+# is the authoritative "PyCharm is installed" signal — just having the dir
+# present isn't enough (a half-broken extract leaves a directory but no
+# launcher, and the previous "dir is non-empty" check falsely SKIP'd those).
+detect_pycharm_launcher() {
+  local cand
+  for cand in "$PYCHARM_DIR/bin/pycharm.sh" "$PYCHARM_DIR/bin/pycharm"; do
+    [[ -f "$cand" ]] && { echo "$cand"; return 0; }
+  done
+  [[ -d "$PYCHARM_DIR/bin" ]] || return 1
+  find "$PYCHARM_DIR/bin" -maxdepth 1 -type f \
+       \( -name 'pycharm*' -o -name 'PyCharm*' \) 2>/dev/null | head -n1
+}
+
+pyc_bin="$(detect_pycharm_launcher)"
+if [[ -n "$pyc_bin" ]]; then
   mark "PyCharm" SKIP "already present ($PYCHARM_DIR)"
 else
   pyc_tmp="$TMP_ROOT/pycharm"; mkdir -p "$pyc_tmp"
   log "Downloading PyCharm from $PYCHARM_URL"
   if curl -fSL "$PYCHARM_URL" -o "$pyc_tmp/pycharm.tar.gz" 2>>"$LOG_FILE" \
      && tar -xzf "$pyc_tmp/pycharm.tar.gz" -C "$pyc_tmp" 2>>"$LOG_FILE"; then
-    # Find the extracted top-level directory (tarball has exactly one)
     src="$(find "$pyc_tmp" -mindepth 1 -maxdepth 1 -type d | head -n1)"
     if [[ -z "$src" ]]; then
       mark "PyCharm" FAIL "tarball extracted but no top-level directory found"
     else
       log "PyCharm extracted to: $src"
       rm -rf "$PYCHARM_DIR"; mv "$src" "$PYCHARM_DIR"
-
-      # Find the launcher: try common names, then any pycharm* executable in bin/
-      pyc_bin=""
-      for cand in "$PYCHARM_DIR/bin/pycharm.sh" "$PYCHARM_DIR/bin/pycharm"; do
-        [[ -f "$cand" ]] && { pyc_bin="$cand"; break; }
-      done
-      if [[ -z "$pyc_bin" ]] && [[ -d "$PYCHARM_DIR/bin" ]]; then
-        pyc_bin="$(find "$PYCHARM_DIR/bin" -maxdepth 1 -type f \
-                   \( -name 'pycharm*' -o -name 'PyCharm*' \) 2>/dev/null | head -n1)"
-      fi
-
+      pyc_bin="$(detect_pycharm_launcher)"
       if [[ -n "$pyc_bin" ]]; then
-        chmod 0755 "$pyc_bin"
-        ln -sf "$pyc_bin" /usr/local/bin/pycharm
-        # Pick whichever icon file actually shipped
-        pyc_icon=""
-        for ic in pycharm.svg pycharm.png pycharm-professional.svg pycharm-professional.png; do
-          [[ -f "$PYCHARM_DIR/bin/$ic" ]] && { pyc_icon="$PYCHARM_DIR/bin/$ic"; break; }
-        done
-        cat > /usr/share/applications/pycharm.desktop <<EOF
+        mark "PyCharm" OK "installed ($PYCHARM_DIR -> $pyc_bin)"
+      else
+        log "PyCharm bin/ contents:"
+        ls -la "$PYCHARM_DIR/bin" 2>>"$LOG_FILE" >>"$LOG_FILE"
+        mark "PyCharm" FAIL "extracted to $PYCHARM_DIR but no launcher found in bin/ (see log)"
+      fi
+    fi
+  else
+    mark "PyCharm" FAIL "download or extract failed — check log"
+  fi
+fi
+
+# Always (re)write the .desktop entry if a launcher exists — heals endpoints
+# where PyCharm is present but the launcher entry was lost or never written.
+if [[ -n "$pyc_bin" ]]; then
+  chmod 0755 "$pyc_bin"
+  ln -sf "$pyc_bin" /usr/local/bin/pycharm
+  pyc_icon=""
+  for ic in pycharm.svg pycharm.png pycharm-professional.svg pycharm-professional.png; do
+    [[ -f "$PYCHARM_DIR/bin/$ic" ]] && { pyc_icon="$PYCHARM_DIR/bin/$ic"; break; }
+  done
+  cat > /usr/share/applications/pycharm.desktop <<EOF
 [Desktop Entry]
 Name=PyCharm
 Exec=$pyc_bin %f
@@ -424,17 +598,9 @@ Categories=Development;IDE;
 Terminal=false
 StartupWMClass=jetbrains-pycharm
 EOF
-        mark "PyCharm" OK "installed ($PYCHARM_DIR -> $pyc_bin)"
-      else
-        # Dump bin/ contents so we can see what JetBrains actually shipped
-        log "PyCharm bin/ contents:"
-        ls -la "$PYCHARM_DIR/bin" 2>>"$LOG_FILE" >>"$LOG_FILE"
-        mark "PyCharm" FAIL "extracted to $PYCHARM_DIR but no launcher found in bin/ (see log)"
-      fi
-    fi
-  else
-    mark "PyCharm" FAIL "download or extract failed — check log"
-  fi
+  chmod 0644 /usr/share/applications/pycharm.desktop
+  log "Wrote /usr/share/applications/pycharm.desktop"
+  refresh_desktop_db
 fi
 
 # --- JetBrains Toolbox (staged binary, per-user GUI for IDE version mgmt) ---
