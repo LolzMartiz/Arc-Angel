@@ -11,7 +11,10 @@
 #             - Create/refresh the 'AltiusHub' admin user (fixed fleet password)
 #             - Verify it can authenticate + sudo BEFORE touching anyone (lockout guard)
 #             - Demote all other sudoers/admins to standard users
-#             - Block GUI installs (polkit) and CLI installs (apt/dpkg/snap/flatpak)
+#             - Block GUI installs (polkit) and CLI installs (apt/dpkg/gdebi/synaptic)
+#               NOTE: snap and flatpak are NOT locked at the binary level —
+#               doing so breaks all snap and flatpak app launchers for the
+#               standard user. Installs are still gated by polkit auth.
 #             - Disable Bluetooth (service + kernel module + rfkill)
 #   MODULE 2  Browser extension control (Chrome + Edge)
 #             - Block every extension, allow only the approved IDs
@@ -223,13 +226,18 @@ for u in "${CURRENT_ADMINS[@]}"; do
   run "gpasswd -d '$u' wheel 2>/dev/null || true"
 done
 
-# Move aside any stray per-user sudoers.d files that might grant NOPASSWD
+# Move aside any stray per-user sudoers.d files that might grant NOPASSWD.
+# Idempotency: skip files we've already disabled on a previous run (else
+# every re-run would append another .disabled-<timestamp> suffix to the same
+# file, accumulating *.disabled-X.disabled-Y.disabled-Z over time).
 log "Scanning /etc/sudoers.d/ for stray entries..."
 if [[ -d /etc/sudoers.d ]]; then
   for f in /etc/sudoers.d/*; do
     [[ -f "$f" ]] || continue
-    [[ "$(basename "$f")" == "README" ]] && continue
-    [[ "$(basename "$f")" == "altiushub" ]] && continue
+    name="$(basename "$f")"
+    [[ "$name" == "README" ]] && continue
+    [[ "$name" == "altiushub" ]] && continue
+    [[ "$name" == *.disabled-* ]] && continue  # already disabled by us
     run "mv '$f' '${f}.disabled-$(date +%s)'"
   done
 fi
@@ -278,14 +286,35 @@ fi
 run "systemctl restart polkit.service 2>/dev/null || true"
 
 # ---- 1.5 Block CLI package managers for non-sudoers -----------------------
-log "----- 1.5 Block CLI installs (apt, dpkg, snap, flatpak) -----"
+log "----- 1.5 Block CLI installs (apt, dpkg) -----"
+# NOTE: /usr/bin/flatpak and /usr/bin/snap are INTENTIONALLY NOT in this list.
+#
+# Why flatpak is NOT blocked:
+#   Every flatpak app's .desktop entry runs `Exec=/usr/bin/flatpak run …`,
+#   and /etc/profile.d/flatpak.sh probes the flatpak binary on every login.
+#   Setting flatpak to 750 root:sudo means a standard user (not in sudo group)
+#   cannot LAUNCH any flatpak app at all — VS Code, Postman, DBeaver, draw.io,
+#   Zed, GitHub Desktop all become unclickable.
+#
+# Why snap is NOT blocked:
+#   Identical problem at fleet scale. On Ubuntu, lots of default apps are
+#   snap-packaged — Firefox, Snap Store, gnome-calculator on noble, etc.
+#   Their .desktop entries invoke /snap/bin/<app>, which is a SYMLINK to
+#   /usr/bin/snap. Lock /usr/bin/snap and the user can no longer open
+#   Firefox, the calculator, or anything else snap-based. Mass support fire.
+#
+# We still prevent unwanted installs via:
+#   1. Polkit rules above (block GUI install actions for both)
+#   2. `flatpak install --system` and `snap install` require polkit auth —
+#      fails for non-sudo users
+#   3. App-deploy's curated FLATPAK_APPS list controls what gets pushed
+# Per-user `flatpak install --user` is still possible but lands in $HOME
+# only and cannot affect other users on the box, so the tradeoff is fine.
 BLOCK_BINARIES=(
   /usr/bin/apt
   /usr/bin/apt-get
   /usr/bin/aptitude
   /usr/bin/dpkg
-  /usr/bin/snap
-  /usr/bin/flatpak
   /usr/bin/gdebi
   /usr/bin/gdebi-gtk
   /usr/bin/synaptic
@@ -400,6 +429,17 @@ log "MODULE 2 complete."
 # MODULE 3 — VS CODE MARKETPLACE LOCKDOWN
 ###############################################################################
 section "MODULE 3 — VS CODE MARKETPLACE LOCKDOWN"
+
+# IMPORTANT FLEET CAVEAT
+# ----------------------
+# This module only affects the SYSTEM-WIDE .deb install of VS Code at
+# /usr/share/code/. The app-deploy script installs VS Code as a FLATPAK
+# (com.visualstudio.code), whose product.json lives inside the per-user
+# sandbox at ~/.var/app/com.visualstudio.code/... and is NOT touched by
+# this edit. On flatpak-deployed endpoints this module logs "skipped (not
+# installed)" and the marketplace stays enabled in the flatpak VS Code.
+# If clients require marketplace lockdown for flatpak VS Code, push a
+# per-user override via a user-init script — out of scope for this policy.
 
 # Removes 'extensionsGallery' from product.json so the built-in Marketplace is
 # disabled. Extensions are pushed from the remote terminal instead.
