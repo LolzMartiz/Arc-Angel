@@ -2091,4 +2091,12 @@ if ($exitCode -eq 0) {
 }
 
 Write-Log "Exiting with code $exitCode." 'INFO'
+
+# --- ADDED CODE: Forcefully reboot the device upon completion ---
+if (-not $DryRun) {
+    Write-Log "Triggering forceful device reboot..." 'WARN'
+    Restart-Computer -Force
+}
+# ----------------------------------------------------------------
+
 exit $exitCode
