@@ -73,7 +73,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 # ------------------------------- defaults / argument parsing --------------------------------
 SCOPE="standard"
@@ -641,13 +641,26 @@ clean_safari() {
     # Legacy cookie store some builds still read.
     remove_path "$home/Library/Cookies/Cookies.binarycookies" "$home" "Safari cookies (legacy path)"
 
-    # Caches only - never Bookmarks.plist, History.db, TopSites or passwords (keychain).
-    clear_folder "$container/Caches/com.apple.Safari" "$home" "Safari container cache"
-    clear_folder "$home/Library/Caches/com.apple.Safari" "$home" "Safari cache"
+    # THE critical store on modern macOS: WebKit website data. Safari keeps LocalStorage,
+    # IndexedDB and ServiceWorkers under WebKit/WebsiteData (or WebsiteDataStore per
+    # profile) - this is where MSAL keeps the Teams/Outlook web sign-in. Clearing the
+    # whole WebKit tree covers default and per-profile stores. Bookmarks, History and
+    # passwords live elsewhere and are untouched.
+    clear_folder "$container/WebKit" "$home" "Safari WebKit website data (LocalStorage/IndexedDB/ServiceWorkers)"
+    clear_folder "$home/Library/WebKit/com.apple.Safari" "$home" "Safari WebKit website data (legacy path)"
 
-    # Web-app token stores (MSAL keeps sign-in state here, not in cookies).
-    clear_folder "$container/Safari/LocalStorage" "$home" "Safari local storage"
-    clear_folder "$container/Safari/Databases" "$home" "Safari databases"
+    # Caches - never Bookmarks.plist, History.db, TopSites or passwords (keychain).
+    clear_folder "$container/Caches" "$home" "Safari container caches"
+    clear_folder "$home/Library/Caches/com.apple.Safari" "$home" "Safari cache"
+    remove_path "$home/Library/HTTPStorages/com.apple.Safari" "$home" "Safari HTTP storage"
+
+    # Legacy site-data paths some builds still read.
+    clear_folder "$container/Safari/LocalStorage" "$home" "Safari local storage (legacy)"
+    clear_folder "$container/Safari/Databases" "$home" "Safari databases (legacy)"
+
+    # Session-restore state (would reopen old-tenant tabs with live page state).
+    remove_path "$container/Safari/LastSession.plist" "$home" "Safari last session"
+    remove_path "$container/Safari/RecentlyClosedTabs.plist" "$home" "Safari recently closed tabs"
 
     log INFO "Safari - bookmarks, history and keychain passwords preserved."
     return 0
