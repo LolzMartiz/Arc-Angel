@@ -45,10 +45,11 @@
 #    --scope cache|standard|aggressive   Default: standard
 #         cache      = file caches only. No keychain, no OneDrive unlink, no Outlook
 #                      profile reset, no work-account removal. Safest.
-#         standard   = cache + keychain token revocation + Office identity + OneDrive
-#                      unlink + Outlook profile reset + work-account (WPJ) removal.
-#         aggressive = standard + browser local storage/IndexedDB + OneAuth
-#                      universalstorage purge + all Microsoft HTTPStorages.
+#         standard   = cache + keychain token revocation + OneAuth account-store purge
+#                      + Office identity + OneDrive unlink + Outlook profile reset
+#                      + work-account (WPJ) removal + browser web-app sign-out
+#                      (cookies, Local Storage, IndexedDB - where MSAL keeps tokens).
+#         aggressive = standard + all Microsoft HTTPStorages (not just app-matched).
 #    --dry-run              Report everything, change nothing.
 #    --force                Kill apps immediately (no graceful-quit grace period).
 #    --grace N              Seconds to wait for graceful app quit (default 15).
@@ -72,7 +73,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 
 # ------------------------------- defaults / argument parsing --------------------------------
 SCOPE="standard"
@@ -431,10 +432,15 @@ clean_office_prefs_userctx() {
         return 0
     fi
     run_as_user "$uname" "$uid" defaults delete com.microsoft.office OfficeActivationEmailAddress >/dev/null 2>&1
-    # Microsoft-sanctioned OneAuth reset: next launch of an Office app clears OneAuth account state.
-    run_as_user "$uname" "$uid" defaults write com.microsoft.Word ResetOneAuthCreds -bool YES >/dev/null 2>&1
+    # Microsoft-sanctioned OneAuth reset: the next launch of each app clears any remaining
+    # OneAuth account state (accounts shown in the sign-in picker included).
+    local dom
+    for dom in com.microsoft.Word com.microsoft.Excel com.microsoft.Powerpoint \
+               com.microsoft.Outlook com.microsoft.onenote.mac com.microsoft.teams2; do
+        run_as_user "$uname" "$uid" defaults write "$dom" ResetOneAuthCreds -bool YES >/dev/null 2>&1
+    done
     run_as_user "$uname" "$uid" killall cfprefsd >/dev/null 2>&1
-    log OK "Office sign-in preferences reset for $uname (ResetOneAuthCreds staged)."
+    log OK "Office sign-in preferences reset for $uname (ResetOneAuthCreds staged for all Microsoft apps)."
     return 0
 }
 
@@ -571,11 +577,11 @@ clean_chromium_profile() {
         fi
     done
 
+    # Local Storage and IndexedDB are included by default: Microsoft web apps (Teams web,
+    # Outlook web) store MSAL refresh tokens there, NOT in cookies - clearing cookies alone
+    # leaves the browser silently signed in.
     local d
-    local dirs=("Sessions" "Session Storage" "GPUCache" "Service Worker/CacheStorage" "Service Worker/ScriptCache")
-    if [ "$SCOPE" = "aggressive" ]; then
-        dirs+=("Local Storage/leveldb" "IndexedDB")
-    fi
+    local dirs=("Sessions" "Session Storage" "GPUCache" "Service Worker/CacheStorage" "Service Worker/ScriptCache" "Local Storage/leveldb" "IndexedDB")
     for d in "${dirs[@]}"; do
         if [ -d "$pdir/$d" ]; then
             clear_folder "$pdir/$d" "$home" "$label - $d"
@@ -639,10 +645,9 @@ clean_safari() {
     clear_folder "$container/Caches/com.apple.Safari" "$home" "Safari container cache"
     clear_folder "$home/Library/Caches/com.apple.Safari" "$home" "Safari cache"
 
-    if [ "$SCOPE" = "aggressive" ]; then
-        clear_folder "$container/Safari/LocalStorage" "$home" "Safari local storage (aggressive)"
-        clear_folder "$container/Safari/Databases" "$home" "Safari databases (aggressive)"
-    fi
+    # Web-app token stores (MSAL keeps sign-in state here, not in cookies).
+    clear_folder "$container/Safari/LocalStorage" "$home" "Safari local storage"
+    clear_folder "$container/Safari/Databases" "$home" "Safari databases"
 
     log INFO "Safari - bookmarks, history and keychain passwords preserved."
     return 0
@@ -805,20 +810,25 @@ clean_keychain() {
         kc_delete_internet_service "$uname" "$uid" "$kc" "$svc"
     done
 
-    # Aggressive: purge the OneAuth/MSAL universal storage access group from the
-    # data-protection keychain (where modern broker tokens actually live).
-    if [ "$SCOPE" = "aggressive" ]; then
-        local kc2
-        kc2=$(find "$home/Library/Keychains" -maxdepth 2 -name "keychain-2.db" 2>/dev/null | head -1)
-        if [ -n "$kc2" ] && [ -f "$kc2" ]; then
-            if [ "$DRY_RUN" = "1" ]; then
-                log DRY "WOULD purge OneAuth universalstorage access group from $kc2"
+    # Purge the OneAuth/MSAL universal storage access group from the data-protection
+    # keychain. This is where the broker keeps the ACCOUNT LIST that Office and Teams
+    # show in their account pickers - without this, the account entry survives even
+    # after its tokens are revoked (user sees their account listed and only gets a
+    # password prompt). Same technique Microsoft's office-reset tooling uses.
+    local kc2
+    kc2=$(find "$home/Library/Keychains" -maxdepth 2 -name "keychain-2.db" 2>/dev/null | head -1)
+    if [ -n "$kc2" ] && [ -f "$kc2" ]; then
+        if [ "$DRY_RUN" = "1" ]; then
+            log DRY "WOULD purge OneAuth universalstorage account/token group from $kc2"
+        else
+            if sqlite3 "$kc2" "DELETE FROM genp WHERE agrp='UBF8T346G9.com.microsoft.identity.universalstorage';" 2>/dev/null; then
+                log OK "Purged OneAuth account/token store (data-protection keychain) - account pickers will be empty."
             else
-                sqlite3 "$kc2" "DELETE FROM genp WHERE agrp='UBF8T346G9.com.microsoft.identity.universalstorage';" 2>/dev/null \
-                    && log OK "Purged OneAuth universalstorage token group (data-protection keychain)." \
-                    || log WARN "Could not purge universalstorage group (SIP/lock) - ResetOneAuthCreds will handle it at next app launch."
+                log WARN "Could not purge OneAuth universalstorage group (locked) - ResetOneAuthCreds will clear it at next app launch."
             fi
         fi
+    else
+        log SKIP "Data-protection keychain (keychain-2.db) not found."
     fi
 
     log OK "Keychain session-token pass complete. Non-Microsoft entries untouched."
