@@ -30,6 +30,8 @@
 #  SAFETY GUARANTEES (hard-coded, not optional)
 #    * NEVER creates, modifies, disables or deletes any user account.
 #    * NEVER touches Documents, Desktop, Downloads, Pictures, Movies, Music.
+#    * NEVER deletes mail archive files: any .olm or .pst found inside a folder that is
+#      about to be removed is rescued to ~/Documents/Outlook Archives (preserved)/ first.
 #    * NEVER touches synced OneDrive files (~/Library/CloudStorage, ~/OneDrive*).
 #    * NEVER deletes browser Bookmarks, saved passwords (Login Data / keychain
 #      "Safe Storage" keys for Chrome & Edge), Web Data (autofill), Extensions, History.
@@ -73,7 +75,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 # ------------------------------- defaults / argument parsing --------------------------------
 SCOPE="standard"
@@ -444,6 +446,63 @@ clean_office_prefs_userctx() {
     return 0
 }
 
+# --------------------------- mail archive rescue (.olm / .pst) -------------------------------
+preserve_archives() {
+    # preserve_archives <dir_about_to_be_deleted> <user_home> <owner_username>
+    # Moves every .olm / .pst file (case-insensitive) out of a folder that is about to be
+    # removed, into ~/Documents/Outlook Archives (preserved)/<timestamp>/. Documents is
+    # protected by the safety guard, so rescued archives can never be deleted by this script.
+    local dir="$1" home="$2" owner="$3"
+
+    [ -d "$dir" ] || return 0
+
+    local archives
+    archives=$(find "$dir" -type f \( -iname "*.olm" -o -iname "*.pst" \) 2>/dev/null)
+    [ -n "$archives" ] || return 0
+
+    local dest
+    dest="$home/Documents/Outlook Archives (preserved)/$(date +%Y%m%d-%H%M%S)"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "$archives" | while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            log DRY "WOULD preserve mail archive: $f -> $dest/"
+        done
+        return 0
+    fi
+
+    if ! mkdir -p "$dest" 2>/dev/null; then
+        log ERROR "Could not create archive rescue folder '$dest' - $dir will NOT be deleted."
+        return 1
+    fi
+
+    local failed=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        local base target n
+        base=$(basename "$f")
+        target="$dest/$base"
+        n=1
+        while [ -e "$target" ]; do
+            target="$dest/${base%.*} ($n).${base##*.}"
+            n=$((n + 1))
+        done
+        if mv "$f" "$target" 2>/dev/null; then
+            log OK "PRESERVED mail archive: $base -> $target"
+        else
+            log ERROR "Could not rescue mail archive: $f - its parent folder will NOT be deleted."
+            failed=1
+        fi
+    done <<EOF_ARCH
+$archives
+EOF_ARCH
+
+    # Hand the rescued files back to the user (script runs as root).
+    chown -R "$owner" "$home/Documents/Outlook Archives (preserved)" 2>/dev/null
+
+    return $failed
+}
+
 # ------------------------------------ cleanup: Outlook ---------------------------------------
 clean_outlook() {
     local home="$1" uname="$2"
@@ -453,7 +512,12 @@ clean_outlook() {
     local ct="$home/Library/Containers"
 
     # Container = caches, temp state, webview storage. Safe; rebuilds on next launch.
-    remove_path "$ct/com.microsoft.Outlook" "$home" "Outlook app container (caches/session)"
+    # Rescue any .olm/.pst archives first - they are user data, never deleted.
+    if preserve_archives "$ct/com.microsoft.Outlook" "$home" "$uname"; then
+        remove_path "$ct/com.microsoft.Outlook" "$home" "Outlook app container (caches/session)"
+    else
+        log WARN "Outlook app container kept in place because a mail archive could not be rescued."
+    fi
     remove_path "$ct/com.microsoft.Outlook.CalendarWidget" "$home" "Outlook calendar widget container"
 
     if [ "$SCOPE" = "cache" ] || [ "$SKIP_OUTLOOK_PROFILE" = "1" ]; then
@@ -467,7 +531,12 @@ clean_outlook() {
     if [ -d "$gc/UBF8T346G9.Office/Outlook" ]; then
         log INFO "Removing Outlook profile data - Outlook will run first-time setup at next launch."
         log INFO "If this user kept local-only 'On My Computer' folders, they were part of the old profile."
-        remove_path "$gc/UBF8T346G9.Office/Outlook" "$home" "Outlook profile data (old-tenant mail cache)"
+        # Rescue any .olm/.pst archives out of the profile tree before it is removed.
+        if preserve_archives "$gc/UBF8T346G9.Office/Outlook" "$home" "$uname"; then
+            remove_path "$gc/UBF8T346G9.Office/Outlook" "$home" "Outlook profile data (old-tenant mail cache)"
+        else
+            log WARN "Outlook profile data kept in place because a mail archive could not be rescued."
+        fi
     else
         log SKIP "Outlook profile data - not present."
     fi
