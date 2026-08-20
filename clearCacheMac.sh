@@ -30,6 +30,11 @@
 #  SAFETY GUARANTEES (hard-coded, not optional)
 #    * NEVER creates, modifies, disables or deletes any user account.
 #    * NEVER touches Documents, Desktop, Downloads, Pictures, Movies, Music.
+#    * NEVER deletes Outlook mail. The Outlook profile (which contains the old-tenant
+#      server cache AND any local-only "On My Computer" mail - they cannot be separated
+#      at file level) is MOVED to "~/Outlook Profile Backup (old tenant) <timestamp>/",
+#      never deleted. Restoring is a single move back. Actual deletion requires the
+#      explicit --delete-outlook-profile flag.
 #    * NEVER deletes mail archive files: any .olm or .pst found inside a folder that is
 #      about to be removed is rescued to ~/Documents/Outlook Archives (preserved)/ first.
 #    * NEVER touches synced OneDrive files (~/Library/CloudStorage, ~/OneDrive*).
@@ -59,7 +64,11 @@
 #                           for file caches; keychain is always console-user only).
 #    --skip-browsers        Do not touch Safari / Chrome / Edge.
 #    --skip-onedrive        Do not unlink the OneDrive account.
-#    --skip-outlook-profile Keep Outlook profile data (old-tenant mail cache stays).
+#    --skip-outlook-profile   Leave Outlook profile data completely untouched (no backup,
+#                             no reset - old account stays configured in Outlook).
+#    --delete-outlook-profile DESTRUCTIVE: delete the profile instead of backing it up.
+#                             Only .olm/.pst archives are rescued; local-only "On My
+#                             Computer" mail is lost. Use only when certain none exists.
 #    --skip-keychain        Do not touch the keychain at all.
 #    --skip-workaccount     Do not remove work-account / Workplace-Join material.
 #    --log-dir PATH         Default /Library/Logs/PostMigrationCleanup
@@ -75,7 +84,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="2.0.0"
 
 # ------------------------------- defaults / argument parsing --------------------------------
 SCOPE="standard"
@@ -85,7 +94,9 @@ GRACE=15
 CONSOLE_ONLY=0
 SKIP_BROWSERS=0
 SKIP_ONEDRIVE=0
-SKIP_OUTLOOK_PROFILE=0
+# Outlook profile handling: "backup" (default: rename to a visible backup folder - fully
+# reversible, zero data loss), "keep" (leave untouched), "delete" (explicit destructive).
+OUTLOOK_MODE="backup"
 SKIP_KEYCHAIN=0
 SKIP_WORKACCOUNT=0
 LOG_DIR="/Library/Logs/PostMigrationCleanup"
@@ -99,7 +110,8 @@ while [ $# -gt 0 ]; do
         --console-user-only)    CONSOLE_ONLY=1; shift ;;
         --skip-browsers)        SKIP_BROWSERS=1; shift ;;
         --skip-onedrive)        SKIP_ONEDRIVE=1; shift ;;
-        --skip-outlook-profile) SKIP_OUTLOOK_PROFILE=1; shift ;;
+        --skip-outlook-profile) OUTLOOK_MODE="keep"; shift ;;
+        --delete-outlook-profile) OUTLOOK_MODE="delete"; shift ;;
         --skip-keychain)        SKIP_KEYCHAIN=1; shift ;;
         --skip-workaccount)     SKIP_WORKACCOUNT=1; shift ;;
         --log-dir)              LOG_DIR="${2:-$LOG_DIR}"; shift 2 ;;
@@ -520,27 +532,66 @@ clean_outlook() {
     fi
     remove_path "$ct/com.microsoft.Outlook.CalendarWidget" "$home" "Outlook calendar widget container"
 
-    if [ "$SCOPE" = "cache" ] || [ "$SKIP_OUTLOOK_PROFILE" = "1" ]; then
-        log SKIP "Outlook profile data preserved (scope/switch). Old-tenant cached mail remains on disk."
+    if [ "$SCOPE" = "cache" ] || [ "$OUTLOOK_MODE" = "keep" ]; then
+        log SKIP "Outlook profile data left completely untouched (scope/switch)."
         return 0
     fi
 
-    # Profile data = the Mac equivalent of the Windows Outlook profile + OST. Local mail
-    # cache belongs to the OLD tenant mailbox and rebuilds from the new tenant on sign-in.
-    # NOTE: any POP/"On My Computer" local-only folders live here too - flag loudly.
-    if [ -d "$gc/UBF8T346G9.Office/Outlook" ]; then
-        log INFO "Removing Outlook profile data - Outlook will run first-time setup at next launch."
-        log INFO "If this user kept local-only 'On My Computer' folders, they were part of the old profile."
-        # Rescue any .olm/.pst archives out of the profile tree before it is removed.
-        if preserve_archives "$gc/UBF8T346G9.Office/Outlook" "$home" "$uname"; then
-            remove_path "$gc/UBF8T346G9.Office/Outlook" "$home" "Outlook profile data (old-tenant mail cache)"
+    local profdir="$gc/UBF8T346G9.Office/Outlook"
+    local profplist="$gc/UBF8T346G9.Office/OutlookProfile.plist"
+
+    if [ ! -d "$profdir" ]; then
+        log SKIP "Outlook profile data - not present."
+        return 0
+    fi
+
+    # ------------------------------------------------------------------------------------
+    # The Outlook profile database contains BOTH the old-tenant server cache AND any
+    # local-only mail ("On My Computer" folders, POP mail, imported archives). They cannot
+    # be separated at file level. Therefore the profile is NEVER deleted by default:
+    # it is RENAMED to a visible backup folder in the user's home. Outlook runs first-time
+    # setup against the new tenant, and every byte of old mail stays on disk, restorable
+    # by moving the folder back. Deletion only happens with --delete-outlook-profile.
+    # ------------------------------------------------------------------------------------
+    if [ "$OUTLOOK_MODE" = "delete" ]; then
+        log WARN "--delete-outlook-profile requested: profile will be DELETED (only .olm/.pst rescued)."
+        log WARN "Any 'On My Computer' local-only mail inside the profile will be lost."
+        if preserve_archives "$profdir" "$home" "$uname"; then
+            remove_path "$profdir" "$home" "Outlook profile data (old-tenant mail cache)"
         else
             log WARN "Outlook profile data kept in place because a mail archive could not be rescued."
         fi
-    else
-        log SKIP "Outlook profile data - not present."
+        remove_path "$profplist" "$home" "Outlook profile pointer plist"
+        return 0
     fi
-    remove_path "$gc/UBF8T346G9.Office/OutlookProfile.plist" "$home" "Outlook profile pointer plist"
+
+    # Default: reversible backup-by-rename. Same volume, so this is instant and needs no
+    # extra disk space. Never placed under Documents/Desktop (could be OneDrive-synced).
+    local backup
+    backup="$home/Outlook Profile Backup (old tenant) $(date +%Y%m%d-%H%M%S)"
+
+    if [ "$DRY_RUN" = "1" ]; then
+        log DRY "WOULD move Outlook profile data to: $backup"
+        return 0
+    fi
+
+    if ! mkdir -p "$backup" 2>/dev/null; then
+        log ERROR "Could not create backup folder '$backup' - Outlook profile left untouched."
+        return 0
+    fi
+
+    if mv "$profdir" "$backup/Outlook" 2>/dev/null; then
+        ITEMS_REMOVED=$((ITEMS_REMOVED + 1))
+        log OK "Outlook profile data MOVED to backup (nothing deleted): $backup/Outlook"
+        log INFO "Outlook will run first-time setup at next launch. To restore old local mail,"
+        log INFO "move the backup folder back to ~/Library/Group Containers/UBF8T346G9.Office/Outlook"
+        [ -f "$profplist" ] && mv "$profplist" "$backup/OutlookProfile.plist" 2>/dev/null
+        chown -R "$uname" "$backup" 2>/dev/null
+    else
+        rmdir "$backup" 2>/dev/null
+        log WARN "Could not move Outlook profile to backup (locked?) - profile left untouched."
+        RESTART_RECOMMENDED=1
+    fi
     return 0
 }
 
