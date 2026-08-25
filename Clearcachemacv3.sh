@@ -96,7 +96,7 @@ PATH="${PMC_PATH_PREFIX:+$PMC_PATH_PREFIX:}/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 set -u
 
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 
 # =============================================================================================
 #  DEFAULTS
@@ -536,8 +536,9 @@ preflight_report() {
 
     prof="$home/Library/Group Containers/UBF8T346G9.Office/Outlook"
     if [ -d "$prof" ]; then
-        sz=$(folder_size_kb "$prof")
-        log INFO "Outlook mail store present: $(fmt_bytes $((sz * 1024))) - PROTECTED, will not be touched."
+        # Deliberately NOT measured: a large mailbox (100 GB+) takes minutes to size, and
+        # we never touch it anyway, so there is nothing to gain from scanning it.
+        log INFO "Outlook mail store present - PROTECTED, will not be touched."
         omc=$(find "$prof" -maxdepth 3 -type d -name "Omc" 2>/dev/null | head -1)
         [ -n "$omc" ] && log INFO "  'On My Computer' local mail detected (new Outlook Omc store) - PROTECTED."
         nprof=$(find "$prof" -maxdepth 2 -type d -name "*Profiles" 2>/dev/null | head -1)
@@ -546,7 +547,13 @@ preflight_report() {
         log INFO "No Outlook mail store on disk for this user."
     fi
 
-    # Loose archive files the user may care about (report only, capped for speed).
+    # Loose archive files the user may care about. Only scanned during --dry-run: walking a
+    # large home directory is slow and this is purely informational (the deny-list protects
+    # these files regardless of whether we list them).
+    if [ "$SCOPE_DRY" != "1" ]; then
+        log INFO "Mail archives (.olm/.pst) are protected by the deny-list; scan skipped for speed."
+        return 0
+    fi
     n=$(find "$home" -maxdepth 4 \( -iname "*.olm" -o -iname "*.pst" \) 2>/dev/null | head -20 | wc -l | tr -d ' ')
     if [ "${n:-0}" -gt 0 ]; then
         log INFO "$n mail archive file(s) found in this home - PROTECTED by deny-list:"
@@ -679,8 +686,16 @@ clean_teams() {
     fi
 
     remove_path "$gc/UBF8T346G9.com.microsoft.teams" "$home" "New Teams group container"
+    # Delete the Data folder inside each container, NOT the container itself. Every app
+    # container holds a .com.apple.containermanagerd.metadata.plist that macOS protects -
+    # even root cannot remove it - so deleting the container root always logs a scary
+    # "Operation not permitted". Targeting Data removes all Teams state with no error.
     for tid in com.microsoft.teams2 com.microsoft.teams2.launcher com.microsoft.teams2.notificationcenter com.microsoft.teams2.respawn; do
-        remove_path "$ct/$tid" "$home" "Teams container $tid"
+        if [ -d "$ct/$tid" ]; then
+            remove_path "$ct/$tid/Data" "$home" "Teams container data ($tid)"
+        else
+            log SKIP "Teams container $tid - not present."
+        fi
     done
     remove_path "$home/Library/Application Support/Microsoft/Teams" "$home" "Classic Teams cache"
     remove_path "$home/Library/Caches/com.microsoft.teams" "$home" "Classic Teams cache folder"
