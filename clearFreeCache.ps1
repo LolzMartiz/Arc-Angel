@@ -158,6 +158,21 @@ param(
     # a reboot can cut off the RMM's console capture before the log is collected.
     [switch] $NoReboot,
 
+    # Restart the device when finished. OFF BY DEFAULT now: an unannounced reboot loses
+    # unsaved user work and cuts off the RMM's output capture. Opt in explicitly.
+    [switch] $Reboot,
+
+    # Where to re-download this script from when it was launched from memory (irm | iex).
+    # Without a file on disk the user-session phase (Credential Manager, work account)
+    # cannot run at all - see Initialize-SelfOnDisk.
+    [string] $SelfUrl = '',
+
+    # Post-cleanup verification: confirm the mail domain now resolves to the NEW tenant.
+    # Catches the "device went back to the old tenant" case, which is a directory problem,
+    # not a device problem.
+    [string] $VerifyDomain = '',
+    [string] $ExpectedTenantId = '',
+
     [ValidateRange(0, 300)]
     [int] $GraceSeconds = 20,
 
@@ -196,7 +211,7 @@ trap {
 #  SCRIPT STATE
 # =============================================================================================
 
-$script:Version            = '2.0.0'
+$script:Version            = '3.0.0'
 $script:WorkRoot           = 'C:\ProgramData\PostMigrationCleanup'
 $script:LogDir             = $LogPath
 $script:LogFile            = $null
@@ -213,7 +228,7 @@ $script:DoWpjLeave         = $false
 $script:SelfPath           = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Definition }
 
 # --- Diagnostic state -----------------------------------------------------------------------
-$script:DiagVersion        = '2.1.0-diag'
+$script:DiagVersion        = '3.0.0-hardened'
 $script:Diag               = [ordered]@{}                       # environment snapshot
 $script:Steps              = New-Object System.Collections.ArrayList   # per-step results
 $script:Failures           = New-Object System.Collections.ArrayList   # full exception records
@@ -222,6 +237,11 @@ $script:TranscriptStarted  = $false
 $script:TranscriptFile     = ''
 $script:CurrentStep        = 'startup'
 $script:EarlyLogPath       = 'C:\Windows\Temp\PostMigrationCleanup-heartbeat.log'
+$script:SelfMaterialized   = $false
+$script:SelfOnDisk         = $false
+$script:ProtectedResolved  = New-Object System.Collections.ArrayList  # real Desktop/Documents paths
+$script:PstInventory       = New-Object System.Collections.ArrayList  # PSTs found, never deleted
+$script:TenantCheck        = [ordered]@{}
 
 # Directories that must never be deleted from, under any circumstance.
 $script:ForbiddenRoots = @(
@@ -798,6 +818,305 @@ function Get-LocalizationDiagnostics {
     } catch { }
 }
 
+
+# =============================================================================================
+#  RELIABILITY: make sure this script exists as a FILE on disk
+#
+#  The user-session phase (Credential Manager + work account removal) runs through a
+#  scheduled task, which needs a real .ps1 path. When the script is launched from memory
+#  (curl/irm piped into iex) there is no such path, PowerShell cannot recover its own
+#  source, and every user-phase step fails - silently, in the original version. That is the
+#  single most likely reason a fleet machine "ran fine" and still kept its old-tenant
+#  tokens. This makes the condition explicit and recoverable.
+# =============================================================================================
+function Initialize-SelfOnDisk {
+    $staged = Join-Path $script:WorkRoot 'Invoke-PostMigrationCleanup.ps1'
+
+    # Does the invoking path look like a real file?
+    $looksLikePath = $false
+    try {
+        if ($script:SelfPath -and $script:SelfPath.Length -lt 260 -and $script:SelfPath -notmatch '[\r\n]') {
+            $looksLikePath = Test-Path -LiteralPath $script:SelfPath -PathType Leaf
+        }
+    }
+    catch { $looksLikePath = $false }
+
+    try {
+        if (-not (Test-Path -LiteralPath $script:WorkRoot)) {
+            New-Item -ItemType Directory -Path $script:WorkRoot -Force -ErrorAction Stop | Out-Null
+        }
+    }
+    catch {
+        Write-Log "Cannot create $($script:WorkRoot): $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    if ($looksLikePath) {
+        try {
+            Copy-Item -LiteralPath $script:SelfPath -Destination $staged -Force -ErrorAction Stop
+            $script:SelfPath   = $staged
+            $script:SelfOnDisk = $true
+            Write-Log "Script staged for the user phase: $staged" 'OK'
+            return $true
+        }
+        catch { Write-ErrorDetail -Step 'stage-self' -ErrorRecord $_ -Context $script:SelfPath }
+    }
+
+    # Launched from memory. PowerShell cannot reconstruct its own source in this mode, so
+    # the only recovery is to fetch it again from the same URL the RMM used.
+    Write-Log 'This script was launched from memory (piped into iex), not from a file.' 'WARN'
+    if ($SelfUrl) {
+        Write-Log "Re-downloading from -SelfUrl so the user phase can run: $SelfUrl" 'INFO'
+        try {
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+            Invoke-WebRequest -Uri $SelfUrl -OutFile $staged -UseBasicParsing -ErrorAction Stop
+            if ((Test-Path -LiteralPath $staged) -and ((Get-Item -LiteralPath $staged).Length -gt 1024)) {
+                $script:SelfPath         = $staged
+                $script:SelfOnDisk       = $true
+                $script:SelfMaterialized = $true
+                Write-Log "Script recovered to disk: $staged" 'OK'
+                return $true
+            }
+            Write-Log 'Downloaded file looks truncated - not using it.' 'ERROR'
+        }
+        catch { Write-ErrorDetail -Step 'self-download' -ErrorRecord $_ -Context $SelfUrl }
+    }
+
+    Write-Log '*** USER-PHASE STEPS CANNOT RUN ***' 'ERROR'
+    Write-Log 'Credential Manager cleanup and work-account removal both need this script as a' 'ERROR'
+    Write-Log 'file on disk. Re-run it one of these ways instead:' 'ERROR'
+    Write-Log '  powershell -ExecutionPolicy Bypass -File C:\path\clearCache.ps1' 'ERROR'
+    Write-Log '  ...or add -SelfUrl <raw-github-url> to the piped command.' 'ERROR'
+    $script:SelfOnDisk = $false
+    return $false
+}
+
+# =============================================================================================
+#  DATA SAFETY: resolve the user's REAL data folders
+#  Hard-coded names like "Documents" are wrong when OneDrive Known Folder Move or folder
+#  redirection is in play. These are read from the user's own hive and added to the guard.
+# =============================================================================================
+function Register-ProtectedUserPaths {
+    param(
+        [Parameter(Mandatory)] $User,
+        [AllowEmptyString()] [AllowNull()] [string] $HiveRoot = ''
+    )
+
+    $script:ProtectedResolved.Clear()
+
+    # Always protect the classic locations.
+    foreach ($leaf in $script:ProtectedProfileLeaves) {
+        [void]$script:ProtectedResolved.Add((Join-Path $User.ProfilePath $leaf))
+    }
+
+    if (-not $HiveRoot) { return }
+
+    $key = Join-Path $HiveRoot 'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+    if (-not (Test-Path -LiteralPath $key)) { return }
+
+    foreach ($name in @('Personal','Desktop','My Pictures','My Video','My Music','{374DE290-123F-4565-9164-39C4925E467B}')) {
+        try {
+            $v = (Get-ItemProperty -LiteralPath $key -Name $name -ErrorAction Stop).$name
+            if ([string]::IsNullOrWhiteSpace($v)) { continue }
+            $v = $v -replace '%USERPROFILE%', $User.ProfilePath
+            try { $v = [System.Environment]::ExpandEnvironmentVariables($v) } catch { }
+            if ($script:ProtectedResolved -notcontains $v) {
+                [void]$script:ProtectedResolved.Add($v)
+                Write-Diag "protected data folder resolved: $name = $v"
+            }
+        }
+        catch { }
+    }
+}
+
+# =============================================================================================
+#  DATA SAFETY: inventory every PST before the Outlook profile is reset
+#
+#  Resetting the mail profile removes the LINK to a personal folder file. The .pst itself is
+#  never touched, but it disappears from Outlook's folder list, and users report that as
+#  lost mail. Recording the paths first turns a support incident into a two-click fix.
+# =============================================================================================
+function Get-PstInventory {
+    param([Parameter(Mandatory)] $User)
+
+    Write-Log "--- Personal folder files (.pst) for $($User.UserName) ---" 'STEP'
+
+    $roots = @(
+        (Join-Path $User.ProfilePath 'Documents\Outlook Files')
+        (Join-Path $User.LocalApp 'Microsoft\Outlook')
+        (Join-Path $User.RoamingApp 'Microsoft\Outlook')
+        (Join-Path $User.ProfilePath 'Documents')
+        (Join-Path $User.ProfilePath 'Desktop')
+    )
+    foreach ($rp in @($script:ProtectedResolved)) { $roots += $rp }
+
+    $seen = @{}
+    foreach ($root in ($roots | Select-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        try {
+            $found = @(Get-ChildItem -LiteralPath $root -Filter '*.pst' -File -Recurse -Depth 2 -Force -ErrorAction SilentlyContinue)
+        }
+        catch { $found = @() }
+        foreach ($f in $found) {
+            if ($seen.ContainsKey($f.FullName)) { continue }
+            $seen[$f.FullName] = $true
+            [void]$script:PstInventory.Add([pscustomobject]@{
+                User = $User.UserName; Path = $f.FullName
+                SizeBytes = $f.Length; Size = (Format-Bytes $f.Length)
+                LastWrite = $f.LastWriteTime.ToString('s')
+            })
+            Write-Log "  PST FOUND (never deleted): $($f.FullName)  [$(Format-Bytes $f.Length)]" 'INFO'
+        }
+    }
+
+    if ($script:PstInventory.Count -eq 0) {
+        Write-Log '  No .pst files found for this user.' 'SKIP'
+        return
+    }
+
+    # A file the helpdesk can hand to the user.
+    try {
+        $out = Join-Path $script:LogDir ("PstFilesToReattach-{0}.txt" -f ($User.ShortName -replace '[^\w\.-]','_'))
+        $lines = @(
+            "Personal folder files (.pst) found for $($User.UserName) on $env:COMPUTERNAME"
+            "Recorded $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') before the Outlook profile was reset."
+            ''
+            'These files were NOT deleted. Resetting the mail profile only removes the link to'
+            'them, so they will not appear in Outlook until they are re-opened:'
+            ''
+            '  Outlook > File > Open & Export > Open Outlook Data File > pick the file below'
+            ''
+        )
+        foreach ($i in $script:PstInventory) { $lines += ("  {0}   [{1}]" -f $i.Path, $i.Size) }
+        Set-Content -LiteralPath $out -Value $lines -Encoding UTF8 -ErrorAction Stop
+        Write-Log "  Re-attach list written: $out" 'OK'
+    }
+    catch { Write-Log "  Could not write the re-attach list: $($_.Exception.Message)" 'WARN' }
+}
+
+# =============================================================================================
+#  LOCALISATION FIX: read the credential vault through the Win32 API
+#
+#  The original code parsed the console output of cmdkey.exe. That output is TRANSLATED, so
+#  on a non-English Windows the parser can match nothing and the script reports success
+#  having revoked no tokens at all. CredEnumerate returns the same data as structured
+#  values, identically on every language build.
+# =============================================================================================
+function Initialize-CredentialApi {
+    if ('PmcCredApi' -as [type]) { return $true }
+    $code = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+public class PmcCredApi {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct CREDENTIAL {
+        public uint Flags; public uint Type; public IntPtr TargetName; public IntPtr Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize; public IntPtr CredentialBlob; public uint Persist;
+        public uint AttributeCount; public IntPtr Attributes; public IntPtr TargetAlias; public IntPtr UserName;
+    }
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredEnumerate(string filter, uint flag, out uint count, out IntPtr pCredentials);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredDelete(string target, uint type, uint flags);
+    [DllImport("advapi32.dll")]
+    private static extern void CredFree(IntPtr buffer);
+
+    // Returns "<type>|<targetName>" so the caller can delete with the correct type.
+    public static List<string> Enumerate() {
+        var list = new List<string>();
+        uint count = 0; IntPtr pCreds = IntPtr.Zero;
+        if (!CredEnumerate(null, 0, out count, out pCreds)) { return list; }
+        try {
+            for (uint i = 0; i < count; i++) {
+                IntPtr p = Marshal.ReadIntPtr(pCreds, (int)(i * (uint)IntPtr.Size));
+                CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(p, typeof(CREDENTIAL));
+                string t = (c.TargetName != IntPtr.Zero) ? Marshal.PtrToStringUni(c.TargetName) : null;
+                if (!string.IsNullOrEmpty(t)) { list.Add(c.Type.ToString() + "|" + t); }
+            }
+        } finally { if (pCreds != IntPtr.Zero) { CredFree(pCreds); } }
+        return list;
+    }
+
+    public static bool Remove(string target, uint type) {
+        try { return CredDelete(target, type, 0); } catch { return false; }
+    }
+}
+'@
+    try { Add-Type -TypeDefinition $code -ErrorAction Stop; return $true }
+    catch {
+        Write-Log "Credential API unavailable, falling back to cmdkey parsing: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+# =============================================================================================
+#  VERIFICATION: which tenant does the mail domain actually resolve to?
+#  A device can be cleaned perfectly and still land in the old tenant, because the domain
+#  is still verified there. This separates "device problem" from "directory problem".
+# =============================================================================================
+function Test-TenantResolution {
+    param(
+        [Parameter(Mandatory)] [string] $Domain,
+        [string] $ExpectedId = ''
+    )
+
+    Write-Log "--- Tenant resolution check for $Domain ---" 'STEP'
+    $script:TenantCheck['Domain'] = $Domain
+
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+
+    $resolvedId = ''
+    try {
+        $cfg = Invoke-RestMethod -Uri "https://login.microsoftonline.com/$Domain/v2.0/.well-known/openid-configuration" `
+                                 -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        if ($cfg.issuer -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+            $resolvedId = $Matches[1]
+        }
+        Write-Log "  Domain currently resolves to tenant : $resolvedId" 'INFO'
+        $script:TenantCheck['ResolvedTenantId'] = $resolvedId
+    }
+    catch {
+        Write-Log "  Could not query tenant metadata: $($_.Exception.Message)" 'WARN'
+        $script:TenantCheck['ResolvedTenantId'] = "query failed: $($_.Exception.Message)"
+    }
+
+    try {
+        $realm = Invoke-RestMethod -Uri "https://login.microsoftonline.com/getuserrealm.srf?login=user@$Domain&xml=1" `
+                                   -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        $brand = ''
+        try { $brand = [string]$realm.RealmInfo.FederationBrandName } catch { }
+        $nsType = ''
+        try { $nsType = [string]$realm.RealmInfo.NameSpaceType } catch { }
+        if ($brand)  { Write-Log "  Sign-in page branding             : $brand" 'INFO';  $script:TenantCheck['BrandName'] = $brand }
+        if ($nsType) { Write-Log "  Namespace type                    : $nsType" 'INFO'; $script:TenantCheck['NameSpaceType'] = $nsType }
+        if ($nsType -eq 'Federated') {
+            Write-Log '  Domain is FEDERATED - sign-in is redirected to an external identity provider.' 'WARN'
+            Write-Log '  Clearing device caches cannot change where that provider sends the user.' 'WARN'
+        }
+    }
+    catch { Write-Log "  Could not query realm info: $($_.Exception.Message)" 'WARN' }
+
+    if ($ExpectedId -and $resolvedId) {
+        if ($resolvedId -ieq $ExpectedId) {
+            Write-Log "  MATCH: the domain points at the expected (new) tenant." 'OK'
+            $script:TenantCheck['Verdict'] = 'match'
+        }
+        else {
+            Write-Log '*********************************************************************' 'ERROR'
+            Write-Log ' DOMAIN STILL POINTS AT A DIFFERENT TENANT' 'ERROR'
+            Write-Log ("  expected : {0}" -f $ExpectedId) 'ERROR'
+            Write-Log ("  actual   : {0}" -f $resolvedId) 'ERROR'
+            Write-Log ' No amount of cache clearing will fix this. The domain must be removed' 'ERROR'
+            Write-Log ' from the old tenant and verified in the new one.' 'ERROR'
+            Write-Log '*********************************************************************' 'ERROR'
+            $script:TenantCheck['Verdict'] = 'MISMATCH'
+        }
+    }
+}
+
 # =============================================================================================
 #  SAFETY GUARDS
 # =============================================================================================
@@ -815,6 +1134,28 @@ function Test-PathIsSafeToClear {
 
     if ([string]::IsNullOrWhiteSpace($Path))        { return $false }
     if ([string]::IsNullOrWhiteSpace($ProfileRoot)) { return $false }
+
+    # -----------------------------------------------------------------------------------
+    #  ABSOLUTE DATA DENY-LIST. Checked before anything else and not overridable.
+    #  A .PST is irreplaceable user mail; nothing in this script may ever remove one.
+    # -----------------------------------------------------------------------------------
+    # Reject relative-path tricks literally, without relying on platform normalisation.
+    if ($Path -match '(^|[\\/])\.\.([\\/]|$)')      { return $false }
+
+    if ($Path -match '(?i)\.pst$')                    { return $false }
+    if ($Path -match '(?i)\.(nst|olm|mbox|eml|msg)$') { return $false }
+    if (-not $IncludeOst -and $Path -match '(?i)\.ost$') { return $false }
+
+    # Real (possibly redirected / OneDrive-backed) user data folders for this profile.
+    foreach ($rp in @($script:ProtectedResolved)) {
+        if ([string]::IsNullOrWhiteSpace($rp)) { continue }
+        try { $rpFull = [System.IO.Path]::GetFullPath($rp.TrimEnd('\')) } catch { continue }
+        try { $pFull  = [System.IO.Path]::GetFullPath($Path.TrimEnd('\')) } catch { continue }
+        if ($pFull.Equals($rpFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $pFull.StartsWith($rpFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
 
     try {
         $full     = [System.IO.Path]::GetFullPath($Path.TrimEnd('\'))
@@ -944,7 +1285,8 @@ function Clear-FolderContent {
         return
     }
 
-    $removed = 0
+    $removed   = 0
+    $preserved = 0
     for ($attempt = 1; $attempt -le $Retries; $attempt++) {
 
         $children = @()
@@ -952,6 +1294,26 @@ function Clear-FolderContent {
         if ($children.Count -eq 0) { break }
 
         foreach ($child in $children) {
+            # Re-check EVERY child against the guard. The folder being clearable does not
+            # make its contents clearable: a .pst dropped into a cache folder must still
+            # survive. Also refuses any child that contains a protected data file.
+            if (-not (Test-PathIsSafeToClear -Path $child.FullName -ProfileRoot $ProfileRoot)) {
+                if ($attempt -eq 1) { $preserved++ }
+                Write-Log "  PRESERVED (protected data): $($child.FullName)" 'INFO'
+                Add-Action -Category 'Preserved' -Target $child.FullName -Result 'Preserved' -Detail 'Blocked by data guard'
+                continue
+            }
+            if ($child.PSIsContainer) {
+                $dataInside = @(Get-ChildItem -LiteralPath $child.FullName -Recurse -Force -File -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Extension -match '(?i)^\.(pst|olm|nst)$' -or (-not $IncludeOst -and $_.Extension -match '(?i)^\.ost$') })
+                if ($dataInside.Count -gt 0) {
+                    if ($attempt -eq 1) { $preserved++ }
+                    Write-Log "  PRESERVED folder - contains $($dataInside.Count) mail data file(s): $($child.FullName)" 'WARN'
+                    foreach ($d in $dataInside) { Write-Log "     keeps: $($d.FullName)" 'INFO' }
+                    Add-Action -Category 'Preserved' -Target $child.FullName -Result 'Preserved' -Detail 'Contains mail data'
+                    continue
+                }
+            }
             try {
                 Clear-ItemAttributes -Path $child.FullName
                 if ($child.PSIsContainer) {
@@ -982,6 +1344,15 @@ function Clear-FolderContent {
 
     $leftover = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count
 
+    # Anything left behind on purpose is not a failure and must not ask for a reboot.
+    if ($leftover -gt 0 -and $leftover -le $preserved) {
+        $script:BytesFreed   += $size
+        $script:ItemsRemoved += $removed
+        Write-Log "$Description - cleared; $preserved item(s) deliberately preserved (user mail data)." 'OK'
+        Add-Action -Category 'Folder' -Target $Path -Result 'ClearedWithPreserved' -Bytes $size -Detail "$preserved preserved"
+        return
+    }
+
     if ($leftover -eq 0) {
         $script:BytesFreed   += $size
         $script:ItemsRemoved += $removed
@@ -991,7 +1362,7 @@ function Clear-FolderContent {
     else {
         $script:BytesFreed   += $size
         $script:ItemsRemoved += $removed
-        Write-Log "$Description - partially cleared, $leftover item(s) still locked. A restart will release them." 'WARN'
+        Write-Log "$Description - partially cleared, $($leftover - $preserved) item(s) still locked ($preserved preserved on purpose). A restart will release them." 'WARN'
         Add-Action -Category 'Folder' -Target $Path -Result 'Partial' -Bytes $size -Detail "$leftover locked"
         $script:RebootRequired = $true
     }
@@ -1829,23 +2200,59 @@ function Invoke-CredentialManagerCleanup {
     Write-Log "--- Session token revocation (credential vault): $env:USERNAME ---" 'STEP'
 
     $allowList = Get-CredentialAllowList
-    $raw = @()
-    try { $raw = @(& cmdkey.exe /list 2>&1) }
-    catch {
-        Write-Log "Could not enumerate stored credentials: $($_.Exception.Message)" 'WARN'
-        return
-    }
+    $targets   = New-Object System.Collections.ArrayList
+    $credTypes = @{}
+    $method    = 'none'
 
-    # Target prefixes are NOT localised, so match on them rather than the "Target:" label,
-    # which is translated on non-English Windows.
-    $targets = New-Object System.Collections.ArrayList
-    foreach ($line in $raw) {
-        $text = [string]$line
-        if ($text -match '(?i)((?:LegacyGeneric|WindowsLive|MicrosoftAccount|Domain|virtualapp)\s*:\s*\S.*)$') {
-            $t = $Matches[1].Trim()
-            if ($t -and ($targets -notcontains $t)) { [void]$targets.Add($t) }
+    # ------------------------------------------------------------------------------------
+    #  PREFERRED: the Win32 credential API. Language-independent, so it behaves identically
+    #  on Italian, German or English Windows. The old text-parsing path is only a fallback.
+    # ------------------------------------------------------------------------------------
+    if (Initialize-CredentialApi) {
+        try {
+            $entries = @([PmcCredApi]::Enumerate())
+            foreach ($e in $entries) {
+                $parts = ([string]$e).Split('|', 2)
+                if ($parts.Count -ne 2) { continue }
+                $t = $parts[1].Trim()
+                if (-not $t) { continue }
+                if ($targets -notcontains $t) { [void]$targets.Add($t) }
+                $credTypes[$t] = [uint32]$parts[0]
+            }
+            $method = 'Win32 CredEnumerate API'
+            Write-Log "Credential vault read through the Win32 API ($($targets.Count) entries)." 'OK'
+        }
+        catch {
+            Write-ErrorDetail -Step 'cred-enumerate-api' -ErrorRecord $_
+            $targets.Clear()
         }
     }
+
+    # ------------------------------------------------------------------------------------
+    #  FALLBACK: parse cmdkey output. Kept only for the case where the API is blocked.
+    # ------------------------------------------------------------------------------------
+    if ($targets.Count -eq 0) {
+        $raw = @()
+        try { $raw = @(& cmdkey.exe /list 2>&1) }
+        catch {
+            Write-Log "Could not enumerate stored credentials: $($_.Exception.Message)" 'WARN'
+            return
+        }
+        foreach ($line in $raw) {
+            $text = [string]$line
+            if ($text -match '(?i)((?:LegacyGeneric|WindowsLive|MicrosoftAccount|Domain|virtualapp)\s*:\s*\S.*)$') {
+                $t = $Matches[1].Trim()
+                if ($t -and ($targets -notcontains $t)) { [void]$targets.Add($t) }
+            }
+        }
+        $method = 'cmdkey text parsing (fallback)'
+        if ($targets.Count -eq 0 -and $raw.Count -gt 3) {
+            Write-Log 'cmdkey produced output but nothing could be parsed from it - this is the' 'ERROR'
+            Write-Log 'classic non-English Windows failure. Raw text is in the diagnostic receipt.' 'ERROR'
+            $script:Diag['SuspectedLocaleParsingFailure'] = $true
+        }
+    }
+    $script:Diag['CredentialEnumerationMethod'] = $method
 
     if ($targets.Count -eq 0) {
         Write-Log 'No stored credentials found.' 'SKIP'
@@ -1873,6 +2280,19 @@ function Invoke-CredentialManagerCleanup {
             Add-Action -Category 'Credential' -Target $target -Result 'DryRun'
             $deleted++
             continue
+        }
+
+        # Prefer the API (locale-independent, no console parsing) and fall back to cmdkey.
+        if ($credTypes.ContainsKey($target) -and ('PmcCredApi' -as [type])) {
+            try {
+                if ([PmcCredApi]::Remove($target, $credTypes[$target])) {
+                    Write-Log "Deleted credential (API): $target" 'OK'
+                    Add-Action -Category 'Credential' -Target $target -Result 'Deleted'
+                    $deleted++
+                    continue
+                }
+            }
+            catch { Write-Diag "API delete failed for '$target', trying cmdkey." }
         }
 
         try {
@@ -2427,7 +2847,50 @@ function Write-Summary {
     if ($script:Diag.Contains('CimHealthy') -and -not $script:Diag['CimHealthy']) {
         Write-Log '*** LIKELY ROOT CAUSE: WMI/CIM is not responding - user detection cannot work. ***' 'ERROR'
     }
+    if ($script:PstInventory.Count -gt 0) {
+        Write-Log ("Personal folders  : {0} .pst file(s) found and PRESERVED" -f $script:PstInventory.Count)
+        Write-Log '  Outlook will not show them until they are re-opened:' 'INFO'
+        Write-Log '  File > Open & Export > Open Outlook Data File (see PstFilesToReattach-*.txt)' 'INFO'
+    }
+    if (-not $script:SelfOnDisk -and -not $UserPhase) {
+        Write-Log 'Credential phase  : NOT RUN - the script had no file on disk (see above).' 'ERROR'
+    }
     Write-Log '=================================================================' 'STEP'
+
+    # --- Windows event log, so an RMM can collect the outcome centrally ---
+    try {
+        $srcName = 'PostMigrationCleanup'
+        if (-not [System.Diagnostics.EventLog]::SourceExists($srcName)) {
+            New-EventLog -LogName Application -Source $srcName -ErrorAction Stop
+        }
+        $evtType = if ($script:ErrorCount -gt 0) { 'Error' } elseif ($script:WarningCount -gt 0) { 'Warning' } else { 'Information' }
+        $evtMsg  = "PostMigrationCleanup v$($script:Version) finished. Users=$ProcessedUsers Items=$($script:ItemsRemoved) " +
+                   "Warnings=$($script:WarningCount) Errors=$($script:ErrorCount) PST=$($script:PstInventory.Count) " +
+                   "FailedSteps=$(@($script:Steps | Where-Object { $_.Status -eq 'FAILED' }).Count) Log=$($script:LogFile)"
+        Write-EventLog -LogName Application -Source $srcName -EntryType $evtType -EventId 9001 -Message $evtMsg -ErrorAction Stop
+        Write-Log 'Result written to the Windows Application event log (source PostMigrationCleanup, id 9001).' 'INFO'
+    }
+    catch { Write-Diag "Event log write skipped: $($_.Exception.Message)" }
+
+    # --- one CSV line per device: drop these in a share to compare a whole fleet ---
+    try {
+        $csv  = Join-Path $script:LogDir 'FleetSummary.csv'
+        $head = 'TimestampUtc,Computer,User,OSCaption,UICulture,Version,Phase,Scope,DryRun,Users,Items,Warnings,Errors,FailedSteps,PstFound,CredMethod,SelfOnDisk,TenantVerdict'
+        if (-not (Test-Path -LiteralPath $csv)) { Set-Content -LiteralPath $csv -Value $head -Encoding UTF8 -ErrorAction Stop }
+        $line = '{0},{1},{2},"{3}",{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},"{15}",{16},{17}' -f `
+            (Get-Date).ToUniversalTime().ToString('s'), $env:COMPUTERNAME, $env:USERNAME,
+            $(if ($script:Diag.Contains('OSCaption')) { $script:Diag['OSCaption'] } else { '' }),
+            $(if ($script:Diag.Contains('UICulture')) { $script:Diag['UICulture'] } else { '' }),
+            $script:Version, $(if ($UserPhase) { 'user' } else { 'system' }), $Scope, [bool]$DryRun,
+            $ProcessedUsers, $script:ItemsRemoved, $script:WarningCount, $script:ErrorCount,
+            @($script:Steps | Where-Object { $_.Status -eq 'FAILED' }).Count, $script:PstInventory.Count,
+            $(if ($script:Diag.Contains('CredentialEnumerationMethod')) { $script:Diag['CredentialEnumerationMethod'] } else { '' }),
+            $script:SelfOnDisk,
+            $(if ($script:TenantCheck.Contains('Verdict')) { $script:TenantCheck['Verdict'] } else { 'not-checked' })
+        Add-Content -LiteralPath $csv -Value $line -Encoding UTF8 -ErrorAction Stop
+        Write-Log "Fleet summary line appended: $csv" 'INFO'
+    }
+    catch { Write-Diag "Fleet CSV skipped: $($_.Exception.Message)" }
 
     # Machine-readable receipt for the RMM to collect.
     try {
@@ -2454,6 +2917,13 @@ function Write-Summary {
             Failures        = @($script:Failures)
             FailedStepNames = @($script:Steps | Where-Object { $_.Status -eq 'FAILED' } | ForEach-Object { $_.Step })
             RawToolOutput   = $script:RawCaptures
+            PstInventory    = @($script:PstInventory)
+            PstCount        = $script:PstInventory.Count
+            ProtectedPaths  = @($script:ProtectedResolved)
+            TenantCheck     = $script:TenantCheck
+            SelfOnDisk      = $script:SelfOnDisk
+            SelfMaterialized= $script:SelfMaterialized
+            RebootRequested = [bool]$Reboot
             TranscriptFile  = $script:TranscriptFile
             LogFile         = $script:LogFile
         }
@@ -2501,6 +2971,9 @@ if ($DiagnosticOnly) {
     if ($script:TranscriptStarted) { try { Stop-Transcript | Out-Null } catch { } }
     exit 0
 }
+
+# Make sure we exist as a file BEFORE anything needs to launch us again.
+Invoke-Step -Name 'stage-self-on-disk' -Action { $null = Initialize-SelfOnDisk }
 
 $ctx = Get-ExecutionContextInfo
 Write-Log ("Running as       : {0}" -f $ctx.Name)
@@ -2602,6 +3075,8 @@ try {
         Write-Log " Active : $($user.IsActive)" 'STEP'
         Write-Log "#################################################################" 'STEP'
 
+        $u0 = $user.UserName
+
         # Sanity check the profile path before anything else.
         if (-not (Test-Path -LiteralPath $user.LocalApp)) {
             Write-Log "AppData\Local not found for this profile - skipping." 'WARN'
@@ -2613,9 +3088,18 @@ try {
             $hiveRoot = Open-UserHive -User $user
         }
 
+        # Resolve this user's REAL data folders (OneDrive Known Folder Move / redirection
+        # aware) and register them with the safety guard BEFORE any deletion happens.
+        Invoke-Step -Name 'protect-data-folders' -Context $u0 -Action {
+            Register-ProtectedUserPaths -User $user -HiveRoot $hiveRoot
+        }
+
+        # Record every .pst before the mail profile is reset, so the helpdesk can re-attach.
+        Invoke-Step -Name 'pst-inventory' -Context $u0 -Action { Get-PstInventory -User $user }
+
         # Each step is timed and isolated: one failing step is recorded in full and the
         # rest still run, instead of one exception aborting the whole profile silently.
-        $u = $user.UserName
+        $u = $u0
         Invoke-Step -Name 'identity-cache'   -Context $u -Action { Invoke-IdentityCacheCleanup   -User $user }
         Invoke-Step -Name 'teams'            -Context $u -Action { Invoke-TeamsCleanup           -User $user }
         Invoke-Step -Name 'browsers'         -Context $u -Action { Invoke-BrowserCleanup         -User $user }
@@ -2661,6 +3145,14 @@ catch {
 }
 finally {
     Close-LoadedHives
+
+    # Directory-side verification. Answers "is this a device problem or a tenant problem?"
+    if ($VerifyDomain) {
+        Invoke-Step -Name 'verify-tenant' -Context $VerifyDomain -Action {
+            Test-TenantResolution -Domain $VerifyDomain -ExpectedId $ExpectedTenantId
+        }
+    }
+
     Write-Summary -ProcessedUsers $processedUsers
 }
 
@@ -2682,19 +3174,22 @@ if ($script:TranscriptStarted) {
 #  NOTE FOR FLEET TROUBLESHOOTING: a forced restart terminates the RMM agent's console
 #  capture, so the output you would have used to diagnose the run is lost, and the log
 #  file may never be collected. Use -NoReboot while investigating.
-if (-not $DryRun -and -not $NoReboot) {
-    Write-Log 'Triggering device restart in 60 seconds (allows the RMM to collect output).' 'WARN'
-    Write-Log 'Cancel from an elevated prompt with:  shutdown /a' 'INFO'
+if ($Reboot -and -not $DryRun -and -not $NoReboot) {
+    Write-Log 'Restart requested (-Reboot): restarting in 120 seconds.' 'WARN'
+    Write-Log 'The user can cancel from an elevated prompt with:  shutdown /a' 'INFO'
     try {
-        & (Join-Path $env:SystemRoot 'System32\shutdown.exe') /r /t 60 /c "Post-migration cleanup complete" | Out-Null
+        & (Join-Path $env:SystemRoot 'System32\shutdown.exe') /r /t 120 /c "Post-migration cleanup complete - please save your work" | Out-Null
     }
     catch {
-        Write-Log "Delayed restart failed, falling back to immediate restart: $($_.Exception.Message)" 'WARN'
-        Restart-Computer -Force
+        Write-Log "Delayed restart could not be scheduled: $($_.Exception.Message)" 'WARN'
     }
 }
-elseif ($NoReboot) {
-    Write-Log 'Restart suppressed (-NoReboot). Restart manually to release any locked items.' 'INFO'
+elseif ($script:RebootRequired) {
+    Write-Log 'A restart is RECOMMENDED (some items were locked). No restart was performed.' 'WARN'
+    Write-Log 'Add -Reboot if you want the script to restart the device itself.' 'INFO'
+}
+else {
+    Write-Log 'No restart needed. (Add -Reboot to force one.)' 'INFO'
 }
 # ----------------------------------------------------------------
 
