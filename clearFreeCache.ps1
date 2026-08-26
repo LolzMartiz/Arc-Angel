@@ -228,7 +228,7 @@ $script:DoWpjLeave         = $false
 $script:SelfPath           = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Definition }
 
 # --- Diagnostic state -----------------------------------------------------------------------
-$script:DiagVersion        = '3.0.0-hardened'
+$script:DiagVersion        = '3.2.0-hardened'
 $script:Diag               = [ordered]@{}                       # environment snapshot
 $script:Steps              = New-Object System.Collections.ArrayList   # per-step results
 $script:Failures           = New-Object System.Collections.ArrayList   # full exception records
@@ -920,6 +920,25 @@ function Register-ProtectedUserPaths {
             if ([string]::IsNullOrWhiteSpace($v)) { continue }
             $v = $v -replace '%USERPROFILE%', $User.ProfilePath
             try { $v = [System.Environment]::ExpandEnvironmentVariables($v) } catch { }
+            # SANITY CHECK: a shell-folder value that resolves to the profile root (or an
+            # ancestor of it, or AppData) would make the guard block EVERY path and the
+            # whole cleanup would silently do nothing. Refuse such values.
+            $bad = $false
+            try {
+                $vFull = [System.IO.Path]::GetFullPath($v.TrimEnd('\'))
+                $pFull = [System.IO.Path]::GetFullPath($User.ProfilePath.TrimEnd('\'))
+                if ($vFull.Equals($pFull, [System.StringComparison]::OrdinalIgnoreCase)) { $bad = $true }
+                elseif ($pFull.StartsWith($vFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $bad = $true }
+                elseif ($vFull -match '(?i)\\AppData(\\|$)') { $bad = $true }
+            }
+            catch { $bad = $true }
+
+            if ($bad) {
+                Write-Log "Ignoring implausible protected-folder value for '$name': $v" 'WARN'
+                Write-Log '  (accepting it would have blocked every cleanup path on this profile)' 'WARN'
+                continue
+            }
+
             if ($script:ProtectedResolved -notcontains $v) {
                 [void]$script:ProtectedResolved.Add($v)
                 Write-Diag "protected data folder resolved: $name = $v"
@@ -1057,6 +1076,45 @@ public class PmcCredApi {
 #  A device can be cleaned perfectly and still land in the old tenant, because the domain
 #  is still verified there. This separates "device problem" from "directory problem".
 # =============================================================================================
+function Get-DeviceIdentityHints {
+    <#
+        Reads the signed-in UPN and the tenant the device currently holds a token for,
+        straight out of dsregcmd. Field names there are not localised, so this works on
+        an Italian build exactly as on an English one. Lets the tenant check run with no
+        parameters at all.
+    #>
+    $hints = [ordered]@{ Upn = ''; Domain = ''; DeviceTenantId = '' }
+
+    $exe = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
+    if (-not (Test-Path -LiteralPath $exe)) { return $hints }
+
+    $out = @()
+    try { $out = @(& $exe /status 2>&1) } catch { return $hints }
+
+    foreach ($line in $out) {
+        $t = [string]$line
+
+        # Any UPN-looking token on an account line.
+        if (-not $hints.Upn) {
+            if ($t -match '(?i)(Executing Account Name|UserPrincipalName|registeredUserPrincipalName)\s*:\s*(.+)$') {
+                $val = $Matches[2]
+                if ($val -match '([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})') {
+                    $hints.Upn    = $Matches[1]
+                    $hints.Domain = ($Matches[1] -split '@')[1]
+                }
+            }
+        }
+
+        # The tenant this device currently authenticates against.
+        if (-not $hints.DeviceTenantId) {
+            if ($t -match '(?i)(AzureAdPrtAuthority|TenantId)\s*:\s*.*?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                $hints.DeviceTenantId = $Matches[2]
+            }
+        }
+    }
+    return $hints
+}
+
 function Test-TenantResolution {
     param(
         [Parameter(Mandatory)] [string] $Domain,
@@ -1098,6 +1156,24 @@ function Test-TenantResolution {
         }
     }
     catch { Write-Log "  Could not query realm info: $($_.Exception.Message)" 'WARN' }
+
+    # What tenant is this device itself bound to right now? A difference between these two
+    # is the "device went back to the old tenant" symptom, visible without any parameters.
+    $deviceTenant = ''
+    try { $deviceTenant = (Get-DeviceIdentityHints).DeviceTenantId } catch { }
+    if ($deviceTenant) {
+        Write-Log "  This device currently holds a token for tenant : $deviceTenant" 'INFO'
+        $script:TenantCheck['DeviceTenantId'] = $deviceTenant
+        if ($resolvedId -and ($deviceTenant -ine $resolvedId)) {
+            Write-Log '  NOTE: the device is bound to a DIFFERENT tenant than the domain resolves to.' 'WARN'
+            Write-Log '  After a successful migration these two should match once the user signs in again.' 'WARN'
+            $script:TenantCheck['DeviceVsDomain'] = 'differ'
+        }
+        elseif ($resolvedId) {
+            Write-Log '  Device tenant matches the domain tenant.' 'OK'
+            $script:TenantCheck['DeviceVsDomain'] = 'match'
+        }
+    }
 
     if ($ExpectedId -and $resolvedId) {
         if ($resolvedId -ieq $ExpectedId) {
@@ -3147,10 +3223,26 @@ finally {
     Close-LoadedHives
 
     # Directory-side verification. Answers "is this a device problem or a tenant problem?"
-    if ($VerifyDomain) {
-        Invoke-Step -Name 'verify-tenant' -Context $VerifyDomain -Action {
-            Test-TenantResolution -Domain $VerifyDomain -ExpectedId $ExpectedTenantId
+    # Runs automatically: if no -VerifyDomain was given, the domain is taken from the
+    # signed-in account, so no parameters are needed for this to be useful.
+    $domainToCheck = $VerifyDomain
+    if (-not $domainToCheck) {
+        try {
+            $h = Get-DeviceIdentityHints
+            if ($h.Domain) {
+                $domainToCheck = $h.Domain
+                Write-Log "Tenant check will use the signed-in account's domain: $domainToCheck" 'INFO'
+            }
         }
+        catch { }
+    }
+    if ($domainToCheck) {
+        Invoke-Step -Name 'verify-tenant' -Context $domainToCheck -Action {
+            Test-TenantResolution -Domain $domainToCheck -ExpectedId $ExpectedTenantId
+        }
+    }
+    else {
+        Write-Log 'Tenant check skipped - no work account domain could be detected.' 'SKIP'
     }
 
     Write-Summary -ProcessedUsers $processedUsers
