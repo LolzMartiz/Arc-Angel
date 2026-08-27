@@ -106,7 +106,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # =============================================================================================
 #  STATE
 # =============================================================================================
-$script:Version        = '1.1.0'
+$script:Version        = '1.2.0'
 $script:WorkRoot       = 'C:\ProgramData\PMC'
 $script:LogDir         = $LogDir
 $script:LogFile        = $null
@@ -765,21 +765,66 @@ function Remove-EntraRegisteredAccount {
         }
     }
 
-    # 5. token broker account files for this UPN (file state, reachable from SYSTEM)
+    # 5. Token broker account files for this UPN. These are what keeps the account visible
+    #    to Windows and to app account pickers, so leaving them behind is why an account can
+    #    appear to "come back". The files store text as UTF-16, so a plain text match finds
+    #    nothing - the UPN has to be searched for in BOTH encodings.
     if ($Account.Upn -and -not $ListOnly) {
         $prof = @($script:Profiles | Where-Object { $_.Sid -eq $Account.Sid })
-        if ($prof.Count -eq 1) {
+        if ($prof.Count -ne 1) {
+            Write-Diag "no single profile match for broker cleanup (sid $($Account.Sid))"
+        }
+        else {
             $tb = Join-Path $prof[0].LocalApp 'Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts'
-            if (Test-Path -LiteralPath $tb) {
-                foreach ($f in @(Get-ChildItem -LiteralPath $tb -File -Force -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path -LiteralPath $tb)) {
+                Write-Log '  no token broker account store for this profile.' 'SKIP'
+            }
+            else {
+                $files = @(Get-ChildItem -LiteralPath $tb -File -Force -ErrorAction SilentlyContinue)
+                Write-Log ("  token broker store: {0} file(s) to check" -f $files.Count) 'INFO'
+                $needleA = [System.Text.Encoding]::ASCII.GetBytes($Account.Upn)
+                $needleU = [System.Text.Encoding]::Unicode.GetBytes($Account.Upn)
+                $hits = 0
+                foreach ($f in $files) {
                     $hit = $false
-                    try { if ((Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop) -match [regex]::Escape($Account.Upn)) { $hit = $true } } catch { }
+                    try {
+                        $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+                        foreach ($needle in @($needleA, $needleU)) {
+                            if ($needle.Length -eq 0 -or $bytes.Length -lt $needle.Length) { continue }
+                            $limit = $bytes.Length - $needle.Length
+                            for ($i = 0; $i -le $limit; $i++) {
+                                if ($bytes[$i] -ne $needle[0]) { continue }
+                                $same = $true
+                                for ($j = 1; $j -lt $needle.Length; $j++) {
+                                    if ($bytes[$i + $j] -ne $needle[$j]) { $same = $false; break }
+                                }
+                                if ($same) { $hit = $true; break }
+                            }
+                            if ($hit) { break }
+                        }
+                    }
+                    catch { Write-Diag "could not read $($f.Name): $($_.Exception.Message)" }
                     if (-not $hit) { continue }
+                    $hits++
                     if ($DryRun) { Write-Log "  WOULD delete broker account file $($f.Name)" 'DRY'; continue }
-                    try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; Write-Log "  removed broker account file $($f.Name)" 'GONE' }
+                    try {
+                        Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $script:BackupDir $f.Name) -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                        Write-Log "  removed broker account file $($f.Name)" 'GONE'
+                    }
                     catch { Write-Log "  could not remove $($f.Name): $($_.Exception.Message)" 'WARN' }
                 }
+                if ($hits -eq 0) { Write-Log '  no broker account file referenced this UPN.' 'SKIP' }
             }
+        }
+    }
+
+    # 6. Residual WorkplaceJoin state that can otherwise resurrect the entry.
+    foreach ($rel in @('SOFTWARE\Microsoft\Windows NT\CurrentVersion\WorkplaceJoin\AADNGC',
+                       'SOFTWARE\Microsoft\Windows NT\CurrentVersion\WorkplaceJoin\DeviceValidity')) {
+        $rk = Join-RegPath $Account.HiveRoot $rel
+        if (Test-Path -LiteralPath $rk) {
+            [void](Remove-RegistryKeySafe -PsPath $rk -BackupName "WPJ-residual-$safeName-$(($rel -split '\\')[-1])" -Description "residual WorkplaceJoin state ($(($rel -split '\\')[-1]))")
         }
     }
 
@@ -828,6 +873,50 @@ function Invoke-DeviceLeave {
 # =============================================================================================
 #  REPORTING
 # =============================================================================================
+function Confirm-RemovalWithDsregcmd {
+    <#
+        The registry is where the state lives, but dsregcmd is what Windows itself reports -
+        and it is what Settings eventually reflects. Checking it after removal turns
+        "the page still shows the account" from a mystery into a definite answer.
+    #>
+    $exe = Join-Path $env:SystemRoot 'System32\dsregcmd.exe'
+    if (-not (Test-Path -LiteralPath $exe)) { return }
+
+    Write-Log '--- Post-removal check (dsregcmd) ---' 'STEP'
+    $out = @()
+    try { $out = @(& $exe /status 2>&1) } catch { Write-Log "  could not run dsregcmd: $($_.Exception.Message)" 'WARN'; return }
+    $script:RawCaptures['dsregcmd_status_after'] = ($out | ForEach-Object { [string]$_ }) -join "`n"
+
+    $wpj = ''; $count = ''
+    foreach ($line in $out) {
+        $t = [string]$line
+        if     ($t -match '^\s*WorkplaceJoined\s*:\s*(\S+)')  { $wpj   = $Matches[1] }
+        elseif ($t -match '^\s*WorkAccountCount\s*:\s*(\S+)') { $count = $Matches[1] }
+    }
+    if ($wpj)   { Write-Log ("  WorkplaceJoined  : {0}" -f $wpj) }
+    if ($count) { Write-Log ("  WorkAccountCount : {0}" -f $count) }
+    $script:Diag['WorkplaceJoinedAfter']  = $wpj
+    $script:Diag['WorkAccountCountAfter'] = $count
+
+    # Are any of the UPNs we removed still being reported?
+    $stillListed = @()
+    foreach ($r in @($script:Removed | Where-Object { $_.Upn })) {
+        if ($script:RawCaptures['dsregcmd_status_after'] -match [regex]::Escape($r.Upn)) { $stillListed += $r.Upn }
+        elseif ($r.Thumbprint -and $script:RawCaptures['dsregcmd_status_after'] -match [regex]::Escape($r.Thumbprint)) { $stillListed += $r.Upn }
+    }
+
+    if ($stillListed.Count -eq 0) {
+        Write-Log '  Windows no longer reports the removed account(s).' 'OK'
+        Write-Log '  If Settings still shows it, that is a cached page - sign out or restart.' 'INFO'
+    }
+    else {
+        Write-Log ("  STILL REPORTED by Windows: {0}" -f ($stillListed -join ', ')) 'WARN'
+        Write-Log '  The registry entry is gone but Windows has not released it yet.' 'WARN'
+        Write-Log '  Sign the user out and re-run; if it persists, run this in the USER session:' 'WARN'
+        Write-Log '    dsregcmd /leave' 'WARN'
+    }
+}
+
 function Write-AccountTable {
     param([Parameter(Mandatory)] $Accounts)
     if (@($Accounts).Count -eq 0) { Write-Log 'No work accounts of any kind were found on this device.' 'INFO'; return }
@@ -868,7 +957,16 @@ function Write-Summary {
     Write-Log ("Steps run         : {0} (failed: {1})" -f $script:Steps.Count, $failed.Count)
     foreach ($f in $failed) { Write-Log ("   FAILED STEP: {0} [{1}]" -f $f.Step, $f.Context) 'ERROR' }
     if ($script:RestartAdvised) {
-        Write-Log 'Restart / sign-out: RECOMMENDED - the Settings page refreshes after that.' 'WARN'
+        Write-Log '' 'INFO'
+        Write-Log 'WHAT TO DO NEXT' 'STEP'
+        Write-Log '  1. Sign the user out (or restart). Settings > Accounts caches the account' 'INFO'
+        Write-Log '     list and will keep showing a removed account until then - that is a' 'INFO'
+        Write-Log '     stale page, not a failed removal.' 'INFO'
+        Write-Log '  2. Confirm with:  dsregcmd /status   (run as the USER, not as admin)' 'INFO'
+        Write-Log '     WorkplaceJoined should read NO, and the Work Account block should be gone.' 'INFO'
+        Write-Log '  3. In the OLD tenant, delete the stale device object:' 'INFO'
+        Write-Log '     Entra admin center > Devices > All devices > find this machine > Delete.' 'INFO'
+        Write-Log '     Removing it locally does not remove it from the directory.' 'INFO'
     }
     Write-Log ("Registry backups  : {0}" -f $script:BackupDir)
     Write-Log ("Log file          : {0}" -f $script:LogFile)
@@ -1079,6 +1177,11 @@ try {
                     if (-not $AllowDeviceLeave) { $script:ExitOverride = 5 }
                 }
             }
+        }
+
+        # --- authoritative post-check with dsregcmd ---
+        if ($script:Removed.Count -gt 0 -and -not $DryRun) {
+            Invoke-Step -Name 'verify:dsregcmd' -Action { Confirm-RemovalWithDsregcmd }
         }
 
         # --- verification pass: prove the account really is gone ---
