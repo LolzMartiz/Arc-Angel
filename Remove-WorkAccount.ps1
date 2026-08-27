@@ -106,7 +106,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # =============================================================================================
 #  STATE
 # =============================================================================================
-$script:Version        = '1.0.0'
+$script:Version        = '1.1.0'
 $script:WorkRoot       = 'C:\ProgramData\PMC'
 $script:LogDir         = $LogDir
 $script:LogFile        = $null
@@ -198,7 +198,8 @@ function Write-Log {
     if ($script:LogFile) {
         try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 -ErrorAction Stop } catch { }
     }
-    return 0
+    # Emits NOTHING to the pipeline. Returning a value here would inject it into the output
+    # of every function that logs, and those values then get collected as if they were data.
 }
 
 function Write-Diag {
@@ -513,6 +514,37 @@ function Remove-RegistryKeySafe {
 # =============================================================================================
 #  DISCOVERY
 # =============================================================================================
+function Add-DiscoveredAccount {
+    <#
+        Single gate for everything that lands in $script:Accounts. Anything that is not a
+        properly shaped account object is rejected and logged rather than being carried
+        along and blowing up later in an unrelated place.
+    #>
+    param([Parameter(Mandatory)][AllowNull()] $Candidate)
+
+    if ($null -eq $Candidate) { return }
+
+    # Must be a real custom object. Primitives (an int, a string) would otherwise reach the
+    # property checks below and throw under StrictMode - which is exactly the failure this
+    # gate exists to stop.
+    $typeName = ''
+    try { $typeName = $Candidate.GetType().Name } catch { }
+    if ($typeName -ne 'PSCustomObject') {
+        Write-Diag ("rejected non-object discovery result [{0}]: {1}" -f $typeName, ([string]$Candidate))
+        return
+    }
+
+    $names = @()
+    try { $names = @($Candidate.PSObject.Properties | ForEach-Object { $_.Name }) } catch { }
+    foreach ($needed in @('Kind','User','Upn','TenantId','Thumbprint','JoinKey')) {
+        if ($names -notcontains $needed) {
+            Write-Diag ("rejected malformed account object (missing '{0}')" -f $needed)
+            return
+        }
+    }
+    [void]$script:Accounts.Add($Candidate)
+}
+
 function Get-DeviceJoinState {
     $r = [pscustomobject]@{
         Available = $false; AzureAdJoined = $false; DomainJoined = $false
@@ -598,7 +630,7 @@ function Get-WorkplaceAccounts {
             JoinKey    = (Join-RegPath $joinKey $thumb)
         })
     }
-    return $found
+    return @($found | Where-Object { $_ -is [pscustomobject] })
 }
 
 function Get-StoredIdentityAccounts {
@@ -632,7 +664,7 @@ function Get-StoredIdentityAccounts {
             })
         }
     }
-    return $found
+    return @($found | Where-Object { $_ -is [pscustomobject] })
 }
 
 function Get-MdmEnrollments {
@@ -958,7 +990,7 @@ try {
 
         if ($joinState.AzureAdJoined) {
             $m = Test-AccountMatchesTarget -Upn $joinState.ExecutingAccount -Tenant $joinState.TenantId
-            [void]$script:Accounts.Add([pscustomobject]@{
+            Add-DiscoveredAccount ([pscustomobject]@{
                 Kind = 'EntraJoinedDevice'; User = '(device)'; Sid = ''
                 Upn = $joinState.ExecutingAccount; TenantId = $joinState.TenantId
                 TenantName = $joinState.TenantName; Thumbprint = $joinState.DeviceId
@@ -971,7 +1003,7 @@ try {
     # --- MDM: report only ---
     Invoke-Step -Name 'discover:mdm' -Action {
         $mdm = @(Get-MdmEnrollments)
-        foreach ($e in $mdm) { [void]$script:Accounts.Add($e) }
+        foreach ($e in $mdm) { Add-DiscoveredAccount $e }
         if ($mdm.Count -gt 0) {
             Write-Log "--- MDM enrolments (reported only, never removed) ---" 'STEP'
             foreach ($e in $mdm) { Write-Log ("  {0}  provider={1}" -f $(if($e.Upn){$e.Upn}else{'(no UPN)'}), $e.TenantName) 'INFO' }
@@ -991,8 +1023,8 @@ try {
             Write-Log "--- Profile: $($p.UserName) ---" 'STEP'
             $hive = Open-UserHive -Profile $p
             if (-not $hive) { return }
-            foreach ($a in @(Get-WorkplaceAccounts   -Profile $p -HiveRoot $hive)) { [void]$script:Accounts.Add($a) }
-            foreach ($a in @(Get-StoredIdentityAccounts -Profile $p -HiveRoot $hive)) { [void]$script:Accounts.Add($a) }
+            foreach ($a in @(Get-WorkplaceAccounts   -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
+            foreach ($a in @(Get-StoredIdentityAccounts -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
         }
     }
 
@@ -1011,8 +1043,16 @@ try {
             if ($m.IsMatch) { $matched += $a } else { [void]$script:Kept.Add($a) }
         }
 
+        # Record every non-registration account as kept too, so the summary and the receipt
+        # agree with the verdict table above instead of reporting "kept: 0".
+        foreach ($other in @($script:Accounts | Where-Object { $_.Kind -ne 'EntraRegistered' })) {
+            $mo = Test-AccountMatchesTarget -Upn $other.Upn -Tenant $other.TenantId
+            if (-not $mo.IsMatch) { [void]$script:Kept.Add($other) }
+        }
+
         if ($matched.Count -eq 0) {
             Write-Log 'No per-user work account matched the target domain/tenant.' 'INFO'
+            Write-Log 'Nothing to do for this device - safe to re-run at any time.' 'INFO'
         }
         foreach ($a in $matched) {
             Invoke-Step -Name 'remove:account' -Context $a.Upn -Action { [void](Remove-EntraRegisteredAccount -Account $a) }
