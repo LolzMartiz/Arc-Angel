@@ -106,7 +106,7 @@ $ProgressPreference    = 'SilentlyContinue'
 # =============================================================================================
 #  STATE
 # =============================================================================================
-$script:Version        = '1.2.0'
+$script:Version        = '2.0.0'
 $script:WorkRoot       = 'C:\ProgramData\PMC'
 $script:LogDir         = $LogDir
 $script:LogFile        = $null
@@ -667,6 +667,195 @@ function Get-StoredIdentityAccounts {
     return @($found | Where-Object { $_ -is [pscustomobject] })
 }
 
+function Get-UpnFromBytes {
+    <# Pulls every UPN out of a binary file, trying each encoding Windows might have used. #>
+    param([Parameter(Mandatory)][string] $Path)
+    $found = @()
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        foreach ($enc in @([System.Text.Encoding]::Unicode, [System.Text.Encoding]::ASCII, [System.Text.Encoding]::UTF8)) {
+            $txt = $enc.GetString($bytes)
+            foreach ($m in ([regex]'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}').Matches($txt)) {
+                if ($found -notcontains $m.Value) { $found += $m.Value }
+            }
+        }
+    }
+    catch { }
+    return $found
+}
+
+function Get-BrokerAccounts {
+    <#
+        The Web Account Manager (WAM) account store. THIS is what Settings shows under
+        "Access work or school" once a Workplace Join is gone, and what silently signs
+        Edge and Office back in. Each account is a .tbacct file plus .tbacctpic* siblings.
+    #>
+    param([Parameter(Mandatory)] $Profile)
+
+    $found = New-Object System.Collections.ArrayList
+    $tb = Join-Path $Profile.LocalApp 'Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts'
+    if (-not (Test-Path -LiteralPath $tb)) {
+        Write-Log "  no WAM broker account store for $($Profile.UserName)" 'SKIP'
+        return @()
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $tb -File -Force -Filter '*.tbacct' -ErrorAction SilentlyContinue)
+    Write-Log ("  WAM broker store: {0} account file(s)" -f $files.Count) 'INFO'
+
+    foreach ($f in $files) {
+        $upns = @(Get-UpnFromBytes -Path $f.FullName)
+        $upn  = if ($upns.Count -gt 0) { $upns[0] } else { '' }
+        [void]$found.Add([pscustomobject]@{
+            Kind       = 'BrokerAccount'
+            User       = $Profile.UserName
+            Sid        = $Profile.Sid
+            Upn        = $upn
+            TenantId   = ''
+            TenantName = 'WAM token broker'
+            Thumbprint = $f.BaseName
+            IdpDomain  = ''
+            HiveRoot   = ''
+            JoinKey    = $f.FullName
+        })
+    }
+    return @($found | Where-Object { $_ -is [pscustomobject] })
+}
+
+function Get-OfficeIdentityAccounts {
+    <#
+        Office identity keys are named by GUID, not by UPN - the address lives in the
+        VALUES (EmailAddress / PreferredUsername / EmailAddresses). Reading only the key
+        name is why these looked "unidentified" and were skipped.
+    #>
+    param([Parameter(Mandatory)] $Profile, [Parameter(Mandatory)][string] $HiveRoot)
+
+    $found = New-Object System.Collections.ArrayList
+    foreach ($rel in @('SOFTWARE\Microsoft\Office\16.0\Common\Identity\Identities',
+                       'SOFTWARE\Microsoft\Office\16.0\Common\Identity\Profiles',
+                       'SOFTWARE\Microsoft\IdentityCRL\StoredIdentities',
+                       'SOFTWARE\Microsoft\IdentityCRL\UserExtendedProperties')) {
+        $key = Join-RegPath $HiveRoot $rel
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+
+        foreach ($k in @(Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) {
+            $leaf = Split-Path $k.PSPath -Leaf
+            $upn  = ''
+
+            # 1. the key name itself, when it is an address
+            if ($leaf -match '^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}') { $upn = $Matches[0] }
+
+            # 2. otherwise look inside the values
+            if (-not $upn) {
+                try {
+                    $props = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction Stop
+                    foreach ($n in @('EmailAddress','PreferredUsername','SignInName','EmailAddresses','UserDisplayName','ConnectionUserUpn')) {
+                        if ($upn) { break }
+                        if ($props.PSObject.Properties.Name -notcontains $n) { continue }
+                        $v = [string]$props.$n
+                        if ($v -match '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}') { $upn = $Matches[0] }
+                    }
+                }
+                catch { }
+            }
+
+            [void]$found.Add([pscustomobject]@{
+                Kind       = 'OfficeIdentity'
+                User       = $Profile.UserName
+                Sid        = $Profile.Sid
+                Upn        = $upn
+                TenantId   = ''
+                TenantName = ($rel -split '\\')[-1]
+                Thumbprint = $leaf
+                IdpDomain  = ''
+                HiveRoot   = $HiveRoot
+                JoinKey    = (Join-RegPath $key $leaf)
+            })
+        }
+    }
+    return @($found | Where-Object { $_ -is [pscustomobject] })
+}
+
+function Get-UpnNamedKeys {
+    <# Caches whose key NAME is the UPN, e.g. Office LanguageResources LocalCache. #>
+    param([Parameter(Mandatory)] $Profile, [Parameter(Mandatory)][string] $HiveRoot)
+
+    $found = New-Object System.Collections.ArrayList
+    foreach ($rel in @('SOFTWARE\Microsoft\Office\16.0\Common\LanguageResources\LocalCache',
+                       'SOFTWARE\Microsoft\Office\16.0\Common\Roaming\Identities')) {
+        $key = Join-RegPath $HiveRoot $rel
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+        foreach ($k in @(Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) {
+            $leaf = Split-Path $k.PSPath -Leaf
+            if ($leaf -notmatch '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}') { continue }
+            [void]$found.Add([pscustomobject]@{
+                Kind = 'UpnCache'; User = $Profile.UserName; Sid = $Profile.Sid
+                Upn = $Matches[0]; TenantId = ''; TenantName = ($rel -split '\\')[-1]
+                Thumbprint = ''; IdpDomain = ''; HiveRoot = $HiveRoot
+                JoinKey = (Join-RegPath $key $leaf)
+            })
+        }
+    }
+    return @($found | Where-Object { $_ -is [pscustomobject] })
+}
+
+function Stop-AccountHolders {
+    <#
+        The broker rewrites its account files from memory when a session ends, so deleting
+        them underneath a running broker can simply undo itself. Stopping these first is
+        what makes the removal stick. They all restart on demand.
+    #>
+    if ($DryRun -or $ListOnly) { Write-Log 'WOULD stop the token broker and sign-in helpers.' 'DRY'; return }
+    Write-Log '--- Stopping processes that hold the account open ---' 'STEP'
+    $names = @('Microsoft.AAD.BrokerPlugin','msedge','msedgewebview2','Teams','ms-teams','OUTLOOK','WINWORD','EXCEL','OneDrive','SystemSettings')
+    foreach ($n in $names) {
+        foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; Write-Log "  stopped $($p.ProcessName) (pid $($p.Id))" 'INFO' }
+            catch { Write-Diag "could not stop $($p.ProcessName): $($_.Exception.Message)" }
+        }
+    }
+    Start-Sleep -Seconds 2
+}
+
+function Remove-BrokerAccount {
+    <# Deletes one WAM account file and its picture siblings. #>
+    param([Parameter(Mandatory)] $Account)
+
+    Write-Log "--- Removing WAM broker account: $($Account.Upn) [$($Account.User)] ---" 'STEP'
+    $file = $Account.JoinKey
+    if (-not (Test-Path -LiteralPath $file)) { Write-Log '  already gone.' 'SKIP'; return $true }
+
+    if ($DryRun -or $ListOnly) { Write-Log "  WOULD delete $file (and its .tbacctpic* siblings)" 'DRY'; return $true }
+
+    $dir  = Split-Path $file -Parent
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($file)
+    $ok = $true
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -Force -Filter "$base.*" -ErrorAction SilentlyContinue)) {
+        try {
+            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $script:BackupDir $f.Name) -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+            Write-Log "  removed $($f.Name)" 'GONE'
+        }
+        catch {
+            Write-Log "  could not remove $($f.Name): $($_.Exception.Message)" 'WARN'
+            $ok = $false
+        }
+    }
+    if ($ok) { [void]$script:Removed.Add($Account); $script:RestartAdvised = $true }
+    return $ok
+}
+
+function Remove-KeyedAccount {
+    <# Removes an Office identity / UPN-named cache key. #>
+    param([Parameter(Mandatory)] $Account)
+    Write-Log "--- Removing $($Account.Kind): $($Account.Upn) [$($Account.TenantName)] ---" 'STEP'
+    $name = ('{0}-{1}' -f $Account.Kind, ($Account.Thumbprint -replace '[^\w\.-]','_'))
+    if (Remove-RegistryKeySafe -PsPath $Account.JoinKey -BackupName $name -Description $Account.Kind) {
+        if (-not ($DryRun -or $ListOnly)) { [void]$script:Removed.Add($Account); $script:RestartAdvised = $true }
+        return $true
+    }
+    return $false
+}
+
 function Get-MdmEnrollments {
     $found = New-Object System.Collections.ArrayList
     $key = 'HKLM:\SOFTWARE\Microsoft\Enrollments'
@@ -1121,8 +1310,12 @@ try {
             Write-Log "--- Profile: $($p.UserName) ---" 'STEP'
             $hive = Open-UserHive -Profile $p
             if (-not $hive) { return }
-            foreach ($a in @(Get-WorkplaceAccounts   -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
-            foreach ($a in @(Get-StoredIdentityAccounts -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
+            foreach ($a in @(Get-WorkplaceAccounts     -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
+            foreach ($a in @(Get-OfficeIdentityAccounts -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
+            foreach ($a in @(Get-UpnNamedKeys          -Profile $p -HiveRoot $hive)) { Add-DiscoveredAccount $a }
+            # WAM broker accounts are files, not registry - discovered independently of any
+            # WorkplaceJoin registration, because they outlive it and re-create it.
+            foreach ($a in @(Get-BrokerAccounts        -Profile $p))                 { Add-DiscoveredAccount $a }
         }
     }
 
@@ -1133,12 +1326,21 @@ try {
         Write-Log 'ListOnly requested - no changes made.' 'STEP'
     }
     else {
-        # --- remove per-user registrations that match; keep the rest ---
-        $registrations = @($script:Accounts | Where-Object { $_.Kind -eq 'EntraRegistered' })
+        # --- Removal is dispatched by KIND and is independent of any one store.
+        #     The account can exist in the WAM broker with no WorkplaceJoin registration at
+        #     all - and in that state it is what Settings shows and what re-creates the
+        #     registration at next sign-in. So every store is matched on its own merits.
+        $removable = @($script:Accounts | Where-Object { $_.Kind -in @('EntraRegistered','BrokerAccount','OfficeIdentity','UpnCache','StoredIdentity') })
         $matched = @()
-        foreach ($a in $registrations) {
+        foreach ($a in $removable) {
             $m = Test-AccountMatchesTarget -Upn $a.Upn -Tenant $a.TenantId
             if ($m.IsMatch) { $matched += $a } else { [void]$script:Kept.Add($a) }
+        }
+
+        if ($matched.Count -gt 0) {
+            Write-Log ("{0} item(s) match the target and will be removed:" -f $matched.Count) 'STEP'
+            foreach ($a in $matched) { Write-Log ("   [{0}] {1}" -f $a.Kind, $a.Upn) 'WARN' }
+            Stop-AccountHolders
         }
 
         # Record every non-registration account as kept too, so the summary and the receipt
@@ -1149,24 +1351,15 @@ try {
         }
 
         if ($matched.Count -eq 0) {
-            Write-Log 'No per-user work account matched the target domain/tenant.' 'INFO'
-            Write-Log 'Nothing to do for this device - safe to re-run at any time.' 'INFO'
-        }
-        foreach ($a in $matched) {
-            Invoke-Step -Name 'remove:account' -Context $a.Upn -Action { [void](Remove-EntraRegisteredAccount -Account $a) }
+            Write-Log 'Nothing on this device matches the target domain/tenant.' 'INFO'
+            Write-Log 'Safe to re-run at any time.' 'INFO'
         }
 
-        # stored identities that match but had no registration of their own
-        foreach ($a in @($script:Accounts | Where-Object { $_.Kind -eq 'StoredIdentity' })) {
-            $m = Test-AccountMatchesTarget -Upn $a.Upn -Tenant $a.TenantId
-            if (-not $m.IsMatch) { continue }
-            if (@($script:Removed | Where-Object { $_.Upn -and $a.Upn -and $_.Upn.ToLowerInvariant() -eq $a.Upn.ToLowerInvariant() }).Count -gt 0) { continue }
-            Invoke-Step -Name 'remove:cached-identity' -Context $a.Upn -Action {
-                Write-Log "--- Removing cached identity: $($a.Upn) [$($a.User)] ---" 'STEP'
-                if (Remove-RegistryKeySafe -PsPath $a.JoinKey -BackupName ("Identity-{0}" -f ($a.Upn -replace '[^\w\.-]','_')) -Description 'cached identity') {
-                    [void]$script:Removed.Add($a)
-                    $script:RestartAdvised = $true
-                }
+        foreach ($a in $matched) {
+            switch ($a.Kind) {
+                'EntraRegistered' { Invoke-Step -Name 'remove:registration'  -Context $a.Upn -Action { [void](Remove-EntraRegisteredAccount -Account $a) } }
+                'BrokerAccount'   { Invoke-Step -Name 'remove:wam-account'   -Context $a.Upn -Action { [void](Remove-BrokerAccount        -Account $a) } }
+                default           { Invoke-Step -Name 'remove:cached-identity' -Context $a.Upn -Action { [void](Remove-KeyedAccount       -Account $a) } }
             }
         }
 
