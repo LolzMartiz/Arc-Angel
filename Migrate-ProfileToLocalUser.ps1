@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
     Re-links an existing (e.g. orphaned Entra/AzureAD) Windows profile to a NEW local
-    user account, in place — no file copying. Scriptable ProfWiz-style migration.
+    user account, in place - no file copying. Scriptable ProfWiz-style migration.
 
 .DESCRIPTION
     DRY-RUN BY DEFAULT. Nothing changes without -Execute.
 
     What it does (the same mechanics ForensiT User Profile Wizard performs):
       1. Finds the source profile's SID from HKLM ProfileList by its folder path
-      2. Verifies the profile is NOT in use (hive not loaded) — aborts otherwise
+      2. Verifies the profile is NOT in use (hive not loaded) - aborts otherwise
       3. Creates the new local user (or reuses it, but only if it has never logged on)
       4. Backs up the ProfileList keys to .reg files
       5. Creates a ProfileList entry for the new user's SID pointing at the OLD folder,
@@ -26,11 +26,11 @@
     # Dry run (elevated, from TempAdmin, target user David not yet created)
     .\Migrate-ProfileToLocalUser.ps1 -SourceProfilePath 'C:\Users\david.amsellem' -NewUsername 'David'
 
-    # Real run (elevated) — -MakeAdmin so David-local can later run dsregcmd /leave
+    # Real run (elevated) - -MakeAdmin so David-local can later run dsregcmd /leave
     # and delete TempAdmin himself
     .\Migrate-ProfileToLocalUser.ps1 -SourceProfilePath 'C:\Users\david.amsellem' -NewUsername 'David' -NewPassword 'TempP@ss123!' -MakeAdmin -Execute
     # Then: reboot -> log in as David (local) -> verify files/apps -> register new-tenant
-    # account in Settings. dsregcmd /leave is DEFERRED until verification passes —
+    # account in Settings. dsregcmd /leave is DEFERRED until verification passes -
     # while the device hasn't left the tenant, the .reg backup gives full rollback.
 #>
 
@@ -65,14 +65,14 @@ $srcEntry = Get-ChildItem $plRoot | Where-Object {
     (Get-ItemProperty $_.PSPath -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath -ieq $SourceProfilePath
 }
 if (-not $srcEntry)      { Fail "No ProfileList entry points at $SourceProfilePath" }
-if (@($srcEntry).Count -gt 1) { Fail "Multiple ProfileList entries point at that folder — resolve manually." }
+if (@($srcEntry).Count -gt 1) { Fail "Multiple ProfileList entries point at that folder - resolve manually." }
 $srcSid = Split-Path $srcEntry.Name -Leaf
 Write-Host "Source profile : $SourceProfilePath"
 Write-Host "Source SID     : $srcSid $(if ($srcSid -like 'S-1-12-1-*') { '(Entra ID account)' })"
 
 # --- 2. Profile must not be in use ------------------------------------------
 if ((Test-Path "Registry::HKEY_USERS\$srcSid") -or (Test-Path "Registry::HKEY_USERS\${srcSid}_Classes")) {
-    Fail 'Source profile hive is loaded — that user is logged on (or a service holds the hive). Log them off / reboot first.'
+    Fail 'Source profile hive is loaded - that user is logged on (or a service holds the hive). Log them off / reboot first.'
 }
 
 # --- 3. New local user -------------------------------------------------------
@@ -91,7 +91,7 @@ if ($existing) {
         try {
             New-LocalUser -Name $NewUsername -Password $sec -PasswordNeverExpires:$false | Out-Null
         } catch {
-            Fail "Could not create '$NewUsername' — likely local password policy (length/complexity). Error: $($_.Exception.Message)"
+            Fail "Could not create '$NewUsername' - likely local password policy (length/complexity). Error: $($_.Exception.Message)"
         }
         Add-LocalGroupMember -Group 'Users' -Member $NewUsername
         if ($MakeAdmin) { Add-LocalGroupMember -Group 'Administrators' -Member $NewUsername }
@@ -101,7 +101,7 @@ if ($existing) {
 }
 
 if (-not $Execute) {
-    Write-Host "`nDRY RUN complete — no changes made. Planned actions:" -ForegroundColor Green
+    Write-Host "`nDRY RUN complete - no changes made. Planned actions:" -ForegroundColor Green
     Write-Host "  1. Create local user '$NewUsername'$(if ($MakeAdmin) {' (admin)'})"
     Write-Host "  2. Backup ProfileList keys to $logDir"
     Write-Host "  3. ProfileList: map new SID -> $SourceProfilePath ; remove entry for $srcSid"
@@ -155,7 +155,7 @@ Grant-HiveAccess "$SourceProfilePath\AppData\Local\Microsoft\Windows\UsrClass.da
 Write-Host "`n================ DONE ================" -ForegroundColor Green
 Write-Host "Profile $SourceProfilePath is now assigned to $env:COMPUTERNAME\$NewUsername"
 Write-Host 'Next: REBOOT, log in as the new user, verify desktop/files/Outlook.'
-Write-Host 'IMPORTANT: do NOT log in with the old Entra account again — its profile mapping'
+Write-Host 'IMPORTANT: do NOT log in with the old Entra account again - its profile mapping'
 Write-Host '           is gone; such a login would create a fresh empty profile folder.'
 Write-Host "Rollback: restore $logDir\ProfileList-$srcSid-$stamp.reg and delete the new SID key"
 Write-Host '          (rollback to the old account login only works while the device has NOT left the tenant).'
